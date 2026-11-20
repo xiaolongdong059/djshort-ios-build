@@ -1,0 +1,1196 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:media_kit/media_kit.dart';
+// ignore: implementation_imports
+import 'package:media_kit_video/src/video_controller/android_video_controller/real.dart'
+    show AndroidVideoController;
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:path_provider/path_provider.dart';
+
+import 'api.dart';
+import 'seek_guard.dart';
+import 'trace.dart';
+
+/// 一路播放会话：**持有** `media_kit` 的 `Player` / `VideoController`，
+/// 以及这路流的一切状态（位置、时长、缓冲、错误、续播哨兵）。
+///
+/// ## 为什么需要它（`ROADMAP.md` #65）
+///
+/// 河豚（PiliPala 内核）的小窗 → 全屏**不是路由跳转，也不是新建播放器**：
+/// `plugin/pl_player/controller.dart` 里 `Player`/`VideoController` 是
+/// `PlPlayerController` 的**单实例字段**（`_videoPlayerController ??= Player(...)`），
+/// 全屏只是 `final Rx<bool> _isFullScreen = false.obs` 翻了个值 +
+/// `AutoOrientation.landscapeAutoMode` + `immersiveSticky`；
+/// `plugin/pl_player/utils/fullscreen.dart` 全文**没有一行 `Navigator.push`**，
+/// `Video` 的 `ValueKey` 里也没有 `isFullScreen` —— 连 remount 都没有。
+///
+/// 我们原来的做法是「内嵌播放器 release() → push 一个全新 PlayerPage →
+/// 那边重新 `Player()` + 重新取流 + 重新等 surface + `_resumeTo()`」，
+/// 代价是 1~4s 解码器重建 + 0.1~1.5s 重请求 + ~0.9s 等 surface +
+/// 0~15s 续播校验，而且两个实例抢同一条 m3u8 时会
+/// `Failed to open .../index.m3u8`（与 #32 串音同源）。
+///
+/// 所以把引擎提到会话层：
+///   - **创建与销毁只允许详情页**（`_DetailPageState`）做，与河豚一致；
+///   - 内嵌小窗与全屏页是**同一个会话的两个渲染器**，谁挂载谁画；
+///   - 换集/换线只 `open(url)`，不重建 `Player`（与 #32 不换 GlobalKey 同原则）。
+///
+/// ## 谁被搬进了这里
+///
+/// 原先散在 `VideoPlayerViewState` 里的「媒体层」逻辑全部下沉：
+/// 建实例、绑流、等 surface、`open()`、续播校验、HLS master 剥离、
+/// 硬解失败降级重建、5 秒进度回调、mpv 选项落盘。
+/// 留在 widget 里的只有**纯 UI**：控制条显隐、手势、转屏、全屏按钮。
+///
+/// 高频的位置/时长不经过 `notifyListeners()`（那会让整棵树每几十毫秒重建一次），
+/// 走 [positionOut] / [durationOut] 两个 `ValueNotifier`，由需要的人自己监听。
+class PlaybackSession extends ChangeNotifier {
+  PlaybackSession({
+    required this.url,
+    this.startAt,
+    bool hardwareDecode = true,
+    ValueNotifier<Duration>? positionOut,
+    ValueNotifier<Duration>? durationOut,
+    ValueNotifier<bool>? errorOut,
+  })  : _hwdec = hardwareDecode && !hwdecUnavailable,
+        positionOut = positionOut ?? ValueNotifier<Duration>(Duration.zero),
+        durationOut = durationOut ?? ValueNotifier<Duration>(Duration.zero),
+        errorOut = errorOut ?? ValueNotifier<bool>(false) {
+    _ownsPositionOut = positionOut == null;
+    _ownsDurationOut = durationOut == null;
+    _ownsErrorOut = errorOut == null;
+    _createPlayer();
+    // 起播提速：在与建 surface 并行的空档里先把 HLS master 解析掉
+    // （见 `_directUrlOf`），`_open()` 里 await 时通常已经返回。
+    unawaited(_directUrlOf(url));
+  }
+
+  // ---------- 身份 ----------
+
+  /// 当前在播的地址。换集/换线改它 + 调 [openUrl]。
+  String url;
+
+  /// 下一次 `open()` 要跳到的位置（**只消费一次**）。
+  ///
+  /// 换线/重试不能又跳回入口位置，所以 `_open()` 读完立刻置空。
+  Duration? startAt;
+
+  // ---------- 引擎 ----------
+
+  late Player player;
+  late VideoController controller;
+
+  /// 当前实例是否启用硬解。默认硬解（`ROADMAP.md` #66），
+  /// 失败一次后由 [_rebuildAsSoftware] 降级（原因见该方法上的长注释）。
+  bool _hwdec;
+
+  /// 已经降级过一次就不再降，避免「硬解失败 → 软解失败 → 硬解」死循环。
+  bool _degraded = false;
+
+  /// **进程级**硬解黑名单（`ROADMAP.md` #66）。
+  ///
+  /// 为什么需要它：[_degraded] 是**实例**字段，而换集只走 `openUrl()` 复用实例
+  /// （不重建），所以同一个会话里不会重复踩坑；但用户退出详情页再进来
+  /// 就是**新实例**，`hardwareDecode: true` 会从头再来一遍
+  /// `mediacodec 拿不到 surface → 报错 → 重建 → 1~2s 黑屏`。
+  /// 一旦本进程确认硬解在这台机器上起不来，后续新会话直接用软解。
+  ///
+  /// 不落盘：重启 App 会重试一次硬解 —— 机器 / 系统解码器状态可能已变
+  /// （装了新 ROM、换了解码器实现），永久拉黑反而会让改善永远拿不到。
+  static bool hwdecUnavailable = false;
+
+  // ---------- #52 全屏播放器新增的三项引擎能力 ----------
+
+  /// 播放倍速（`ROADMAP.md` #52 倍速面板，河豚八档
+  /// `0.25/0.5/0.75/1.0/1.25/1.5/1.75/2.0`）。
+  ///
+  /// 会话只负责「设进引擎 + 记住当前值」，**落盘交给页面**
+  ///（`Settings.setPlaybackRate`）—— 会话层不 import 设置模块，
+  /// 才能在测试/多实例下保持无副作用。
+  double rate = 1.0;
+
+  /// 缓冲时长（秒）。河豚三档 `60 / 120 / 300`，默认 60。
+  ///
+  /// 落到 mpv 是 `cache-secs`，在 [_applyPlayerOptions] 里落；
+  /// 硬解失败重建（[_rebuildAsSoftware] → `_createPlayer`）会再落一次，
+  /// 所以必须存在**字段**里，不能只当方法参数。
+  int bufferSecs = 60;
+
+  /// 片头跳过时长（`Duration.zero` = 不跳，对齐河豚滑块最左 `00:00:00`）。
+  ///
+  /// 只在「本次 open 没有续播位置」时生效 —— 续播优先，
+  /// 否则用户上次看到 12:30，一进来被片头跳过拽回 00:00:90 就崩了。
+  Duration skipHead = Duration.zero;
+
+  /// 片尾跳过时长：**距离结尾还剩多少**开始触发（不是绝对位置）。
+  Duration skipTail = Duration.zero;
+
+  /// 片尾已触发的一次性哨兵（换集/重开要复位，否则第二集不跳）
+  bool _tailFired = false;
+
+  /// 片尾到点时回调 —— 页面挂「自动下一集」；没挂就跳到结尾停下。
+  VoidCallback? onTailReached;
+
+  /// [start] 是否已经跑过（surface 等待/开流只跑一次）。
+  bool _started = false;
+
+  bool _disposed = false;
+
+  /// `_open()` 的调用序号：连点选集时只让最后一次的结果生效，
+  /// 免得先回来的旧响应把新流的状态/续播位置盖回去。
+  int _openSeq = 0;
+
+  /// `player.open()` 发出时刻，用来算首帧空窗（`#39`）
+  final Stopwatch _frameSw = Stopwatch();
+
+  /// `_applyPlayerOptions()` 的完成句柄。
+  ///
+  /// `mpv_set_property` 是异步落到解码线程的，`cache-dir` /
+  /// `demuxer-lavf-analyzeduration` 这类属性如果在 `open()` 之后才落，
+  /// 对本次 load 完全无效（mpv 只在 loadfile 时读一次）→ open 前必须 await。
+  Future<void>? _optsReady;
+
+  final List<StreamSubscription> _subs = [];
+
+  Timer? _progressTimer;
+
+  /// 续播后的复核定时器（防 HLS 把位置丢回片头）
+  Timer? _resumeWatch;
+
+  /// 故障注入定时器（仅 DEBUG + `--dart-define=FORCE_HWDEC_FAIL_MS=<ms>`）
+  Timer? _faultTimer;
+
+  /// 伪解码失败的延时；`0` = 关闭（默认，release 恒为 0）。
+  ///
+  /// 为什么需要这个开关：硬解降级（[_rebuildAsSoftware]）只在
+  /// `player.stream.error` 带 `codec` / `mediacodec` / `surface` 字样时才进入，
+  /// 而真机极难稳定制造 MediaCodec 失败 —— `ROADMAP.md` §5.18 §五 试过
+  /// 冷启连点片 / 切后台回前台 / 返回箭头快速连切三种，全都不触发
+  /// （`h264_mediacodec: Both surface and native_window are NULL` 只到
+  /// `stream.log` 的 warn 级，升不到 `stream.error`）。
+  /// 没有注入，改动④「重建保位置」就只有代码走读 + 单测，没有真机日志。
+  ///
+  /// 注入走的是**与真实报错完全相同的入口** [_onStreamError]，
+  /// 连 [_isCodecFailure] 判定都真实执行 —— 唯一差别是谁把这条错误交上来。
+  static const int _faultHwdecFailMs =
+      int.fromEnvironment('FORCE_HWDEC_FAIL_MS', defaultValue: 0);
+
+  /// 已经为「掉回片头」补了几次 seek
+  int _resumeFix = 0;
+
+  /// [firstFrame] 的落位标记（`#39`）。`videoParams` 会持续回报（换分辨率、
+  /// 拖动后重建解码器），只有第一次算「首帧」；换集时由
+  /// [_resetPlaybackState] 复位。
+  bool _frameLogged = false;
+
+  // ---------- 状态（渲染器读它） ----------
+
+  bool playing = false;
+  bool buffering = true;
+  bool completed = false;
+  String? error;
+
+  /// **首帧是否已解出**（`#39`）。
+  ///
+  /// 为什么不能用 `duration > 0` 当「有画面」的判据：`duration` 是
+  /// **demuxer 属性**，HLS 的 playlist 一解析完就有值，但此刻解码器可能
+  /// 一帧都还没吐；反过来软解慢的机器上 duration 也可能晚于首帧。
+  /// 两者不是同一件事，用 duration 当海报撤场判据 ⇒ 海报先走、画面后到，
+  /// 中间露一段纯黑 —— 就是 `#39` 报的那个黑屏。
+  /// 真正的「用户看到画面」信号只有 `player.stream.videoParams`（宽高只有
+  /// 解出一帧才知道，见 [_bindStreams]），所以在此单独记一个布尔。
+  bool firstFrame = false;
+
+  /// 从 `player.open()` 发出到首帧落地的时间（`#39` 空窗量测）。
+  /// 只在 debug 打点里用，未解出首帧时为 null。
+  int? firstFrameMs;
+
+  Duration position = Duration.zero;
+  Duration duration = Duration.zero;
+
+  /// 高频出口。弹幕层靠 [positionOut] 对齐时间轴（每几十毫秒一次），
+  /// 靠 [durationOut] 决定时间轴总长。
+  final ValueNotifier<Duration> positionOut;
+  final ValueNotifier<Duration> durationOut;
+
+  /// 错误态出口：详情页据此撤掉弹幕层（否则会飘在错误提示上面）。
+  final ValueNotifier<bool> errorOut;
+
+  bool _ownsPositionOut = false;
+  bool _ownsDurationOut = false;
+  bool _ownsErrorOut = false;
+
+  /// 每 5 秒 + 会话销毁时回调（进度落盘）。**由创建者设置一次**：
+  /// 详情页持有会话，所以详情页把自己的 `_onProgress` 挂上来。
+  void Function(Duration pos, Duration dur)? onProgress;
+
+  /// 预建 native surface 用的尺寸提示（逻辑像素）。
+  ///
+  /// 这里**只是建 surface 的初始尺寸**，真正的画面尺寸由
+  /// `player.stream.videoParams` 驱动 `SetSurfaceSize` 纠正 ——
+  /// 与 widget 的布局尺寸无关（读 `media_kit_video-1.3.1` 源码确认），
+  /// 所以渲染器换尺寸/重新挂载都不会引发尺寸协商失败。
+  Size surfaceHint = const Size(1280, 720);
+
+  /// 建 surface 时把逻辑像素换成物理像素用
+  double devicePixelRatio = 3.0;
+
+  /// **视频真实像素尺寸**（`#39` 第二层修复的核心）。
+  ///
+  /// 来源：HLS master playlist 的 `#EXT-X-STREAM-INF:...RESOLUTION=1920x1080`
+  /// （见 [_resolveMaster]）。HLS 的 media playlist（variant 表）里**没有**
+  /// 任何分辨率信息，所以除了 master 这一行，起播前拿不到真实尺寸。
+  ///
+  /// 为什么要它：`_ensureSurface()` 若用「渲染器逻辑尺寸 × dpr」建 surface
+  /// （实测 393x851 × 2.75 = 1080x2340，整屏物理高），等真首帧到达
+  /// `videoParams` 报 1920x1080 时，`real.dart` 的 `isSame` 不成立 ⇒
+  /// `SetSurfaceSize(1920,1080)` ⇒ 原生 `onSurfaceAvailable` 建新 surface ⇒
+  /// `VideoOutput.Resize` 回一个新 `wid` ⇒ `widListener()` 把 `vo` 设成 null
+  /// 再设回去 + `await player.seek(Duration.zero)` ⇒ 解复用器 `hr-seek 到 0`、
+  /// 重开 mediacodec、重拉 5.68s 分片 —— **实测 1900ms 纯黑**（7345→9245ms）。
+  /// 预置成真实尺寸后，`videoParams` 首报命中 `isSame` 走早退，整条重建不发生。
+  ///
+  /// 拿不到（非 m3u8 / master 无 RESOLUTION / 请求失败）时为 null，
+  /// 退回旧路径 —— 那时靠 [firstFrame] 的重建感知兜底（见 [_bindStreams]）。
+  Size? videoSizeHint;
+
+  // ---------- 派生 ----------
+
+  bool get disposed => _disposed;
+
+  bool get hasUrl => url.isNotEmpty;
+
+  /// 播放器当前真实位置（换渲染器/换线时要读它，别读缓存字段）
+  Duration get livePosition {
+    if (_disposed) return position;
+    try {
+      return player.state.position;
+    } catch (_) {
+      return position;
+    }
+  }
+
+  double get volume {
+    try {
+      return player.state.volume;
+    } catch (_) {
+      return 100;
+    }
+  }
+
+  bool get isStalled => buffering && !playing;
+
+  void _notify() {
+    if (_disposed) return;
+    notifyListeners();
+  }
+
+  // ---------- 启动 ----------
+
+  /// 挂上第一个渲染器时踢一脚：绑流 → 等 surface → `open()`。
+  ///
+  /// 幂等：内嵌小窗和全屏页都会调一次，只有第一次真的干活。
+  void start() {
+    if (_started || _disposed) return;
+    _started = true;
+    trace('player.start', 'url=${url.isEmpty ? '-' : 'ok'}');
+    _bindStreams();
+    _openWhenSurfaceReady();
+    _progressTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => onProgress?.call(position, duration),
+    );
+  }
+
+  void _createPlayer() {
+    player = Player();
+    controller = VideoController(
+      player,
+      configuration: VideoControllerConfiguration(
+        enableHardwareAcceleration: _hwdec,
+      ),
+    );
+    trace('player.new', 'hwdec=$_hwdec degraded=$_degraded blk=$hwdecUnavailable');
+    _optsReady = _applyPlayerOptions();
+  }
+
+  /// open 之前必须先落的 mpv 选项。
+  ///
+  /// `cache-on-disk=yes` 是 media_kit 的硬编码默认值，但它**没设 `cache-dir`**
+  /// —— Android 上没有 XDG cache 目录，mpv 建缓存文件必然失败，实测每次起播
+  /// 都有一条 `[mpv/lavf/error] Failed to create file cache.`。
+  /// 这里显式给一个可写的应用私有目录，把磁盘缓存真正打开。
+  ///
+  /// ## 起播提速（`ROADMAP.md` #33）
+  ///
+  /// 真机分段打点：`player.open.done 4661ms` → `player.firstframe 11298ms`，
+  /// 同期 PC 直连同一 CDN 拉三跳：master 0.53s + variant 1.65s + 首片 4.83s
+  /// = 7.01s ≈ 实测 6.64s ⇒ **mpv 是把整个首片拉完才吐第一帧的**。
+  /// 根因不是 mpv，而是它把探测权交给 libavformat：
+  /// `analyzeduration` 默认 5 秒、`probesize` 默认 5MB，
+  /// `avformat_find_stream_info` 要读完额度之一才返回 → 对这个片源
+  /// 就是「读完 6.4 秒的第一个分片」。收紧到 0.5s / 1MB 即可：
+  /// 0.5 秒的 H.264/TS 已足够拿到 SPS/PPS 与真实分辨率。
+  Future<void> _applyPlayerOptions() async {
+    try {
+      final dir = await getTemporaryDirectory();
+      final mpvCache = Directory('${dir.path}/mpv-cache');
+      if (!await mpvCache.exists()) {
+        await mpvCache.create(recursive: true);
+      }
+      // Player 的公开接口不暴露 setProperty，只能经 platform 落到 libmpv。
+      final p = player.platform;
+      if (p is NativePlayer) {
+        await p.setProperty('cache-dir', mpvCache.path);
+        await p.setProperty('demuxer-lavf-analyzeduration', '0.5');
+        await p.setProperty('demuxer-lavf-probesize', '1000000');
+        // #52 缓冲设置：河豚「缓冲时长」三档落成 mpv 的 `cache-secs`。
+        // 注意 mpv 的 0 表示「无限」，所以最小值兜到 1，别把 0 透进去。
+        await p.setProperty('cache-secs', '${bufferSecs <= 0 ? 60 : bufferSecs}');
+        // 倍速也要在 open 前落一次：硬解降级会重建 Player，`speed` 会回到 1.0，
+        // 用户在面板里选的 1.5x 不能因为一次降级就悄悄丢掉。
+        if (rate != 1.0) await p.setProperty('speed', '$rate');
+        trace('player.probe.cfg', 'analyzeduration=0.5 probesize=1000000');
+        trace('player.buffer.cfg', 'cache-secs=$bufferSecs');
+        trace('player.opts.done');
+        debugPrint('[player] cache-dir=${mpvCache.path}');
+      } else {
+        debugPrint('[player] platform is ${p.runtimeType}, skip cache-dir');
+      }
+    } catch (e) {
+      debugPrint('[player] cache-dir setup failed: $e');
+    }
+  }
+
+  /// HLS 主播放列表解析结果的进程级缓存（`url → 解析结果`）。
+  ///
+  /// 缓存的是 **Future 而不是值**：`start()` 里踢一脚、`_open()` 里再 await
+  /// 一次，必须是同一个 Future，否则等于发两次 HTTP，把省下来的一跳又赔回去。
+  /// 静态是因为会话可能会换（详情页退出重进），实例级缓存活不过一次页面重建。
+  ///
+  /// 缓存内容从 `String` 升级成 [_MasterInfo]（`#39` 第二层）：分辨率提示
+  /// 必须在 `_ensureSurface()` 之前落到**当前实例**上，而命中的是上一个实例
+  /// 留下的 Future —— 只缓存 URL 的话，第二次进详情页 hint 就丢了。
+  static final Map<String, Future<_MasterInfo>> _masterCache = {};
+
+  /// 把「HLS 主播放列表」在 Dart 侧解析掉，直接给出真正有分片的 variant 地址。
+  ///
+  /// mpv 起一条 HLS 是**串行三跳**，每跳都要等一次 CDN 的 TTFB（1.2~1.5s）：
+  /// ```
+  /// index.m3u8       (master, 96B)   ← 只有一条 #EXT-X-STREAM-INF
+  ///   2000k/index.m3u8 (variant, 14KB) ← 真正的分片表
+  ///     seg0.ts        (814KB)
+  /// ```
+  /// 第一跳拿到的只是**一个纯文本行**，完全不需要 mpv 参与。
+  /// 失败一律**原样返回入参**：任何异常/超时/格式不认识，都退化成
+  /// 「让 mpv 自己从 master 开始解析」，最多是没提速，绝不会更慢或播不出来。
+  Future<String> _directUrlOf(String url) async {
+    if (!url.contains('.m3u8')) return url;
+    var fut = _masterCache[url];
+    if (fut == null) {
+      fut = _resolveMaster(url);
+      _masterCache[url] = fut;
+      // 失败不进缓存，下次重试（换线路/重试按钮走的就是这条路）
+      fut.catchError((Object _) {
+        _masterCache.remove(url);
+        return _MasterInfo(url, null);
+      });
+    }
+    final info = await fut;
+    // 命中缓存也要补一次：hint 是**实例字段**，缓存是进程级
+    if (info.res != null) videoSizeHint = info.res;
+    return info.url;
+  }
+
+  /// 解析 master，返回第一条码率档的地址 + `RESOLUTION`。**只发一次 HTTP，不递归。**
+  ///
+  /// 最初写成「再拉一次 next 看它是不是还是 master」，而 variant 表有
+  /// 14KB / TTFB 1.65s —— 等于把省下来的一跳又赔进去，还多 1.6s 阻塞 open。
+  /// master 套 master 的源极罕见，真遇到就交给 mpv（拿到的仍是合法 m3u8）。
+  Future<_MasterInfo> _resolveMaster(String url) async {
+    final sw = Stopwatch()..start();
+    String body;
+    try {
+      // 3 秒硬超时：解析不出就退回让 mpv 自己走，绝不能比原来更慢。
+      final r = await http
+          .get(Uri.parse(url))
+          .timeout(const Duration(seconds: 3));
+      if (r.statusCode != 200) {
+        trace('hls.master.miss',
+            'code=${r.statusCode} ${sw.elapsedMilliseconds}ms');
+        return _MasterInfo(url, null);
+      }
+      body = utf8.decode(r.bodyBytes, allowMalformed: true);
+    } catch (e) {
+      trace('hls.master.err', '$e ${sw.elapsedMilliseconds}ms');
+      return _MasterInfo(url, null);
+    }
+    // 不是 master（是分片表 / 单码率流）→ 原样用，分辨率未知
+    if (!body.contains('#EXT-X-STREAM-INF')) {
+      trace('hls.master.plain', '${sw.elapsedMilliseconds}ms');
+      return _MasterInfo(url, null);
+    }
+    // 取第一条 STREAM-INF 之后的第一个非注释行 = 最高码率档
+    final lines = const LineSplitter().convert(body);
+    for (var i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+      // `#39`：同一行上的 RESOLUTION=WxH 是**起播前唯一**能拿到的真实尺寸
+      //（variant 表里没有它）。必须在这一行取，下一行只有相对路径。
+      Size? res;
+      final m = RegExp(r'RESOLUTION=(\d+)x(\d+)').firstMatch(lines[i]);
+      if (m != null) {
+        final rw = int.tryParse(m.group(1)!);
+        final rh = int.tryParse(m.group(2)!);
+        if (rw != null && rh != null && rw >= 64 && rh >= 64) {
+          res = Size(rw.toDouble(), rh.toDouble());
+        }
+      }
+      for (var j = i + 1; j < lines.length; j++) {
+        final l = lines[j].trim();
+        if (l.isEmpty || l.startsWith('#')) continue;
+        // 相对路径要用 master 的地址去 resolve，直接字符串拼接会漏掉 query
+        //（很多源带 `?sign=&t=` 鉴权串）。
+        final next = Uri.parse(url).resolve(l).toString();
+        trace('hls.master.ok',
+            '${sw.elapsedMilliseconds}ms → $next res=${res ?? '-'}');
+        return _MasterInfo(next, res);
+      }
+    }
+    return _MasterInfo(url, null);
+  }
+
+  // ---------- 绑流 ----------
+
+  void _bindStreams() {
+    // 起播链路打点 ⑤：`videoParams` 第一次回报 = **首帧已解出**
+    //（宽高只有解出一帧才知道）。这是用户真正「看到画面」的时刻。
+    //
+    // 用字段而不是闭包局部变量：[_bindStreams] 只在 `start()` 里跑一次，
+    // 换集走的是同一个实例（复用 native），闭包里的 flag 会永远停在 true，
+    // 第 2 集起 [firstFrame] 就再也不会复位成 false → 海报再也不出现、
+    // 空窗重新裸露。复位统一交给 [_resetPlaybackState]。
+    _subs.add(player.stream.videoParams.listen((v) {
+      final dw = v.dw;
+      final dh = v.dh;
+      // `#39` 第二层兜底：`dw/dh` 掉成 null/0 = VO 正在被拆。
+      //（尺寸变化 → 原生 `onSurfaceAvailable` → `VideoOutput.Resize` →
+      //  `widListener()` 里 `vo=null` + `seek(Duration.zero)` → 重建解码器。）
+      // 实测这段是 1900ms 纯黑（7345→9245ms，run4）：把海报请回来占位，
+      // 等重建后的真首帧再撤，用户就不会看见空窗。
+      // 预置尺寸命中 `isSame` 时这条根本不会触发（正常路径 0 成本）。
+      if (dw == null || dw == 0 || dh == null || dh == 0) {
+        if (firstFrame) {
+          _frameLogged = false;
+          firstFrame = false;
+          firstFrameMs = null;
+          trace('player.firstframe.lost',
+              '${_frameSw.isRunning ? _frameSw.elapsedMilliseconds : '-'}ms');
+          _notify();
+        }
+        return;
+      }
+      if (_frameLogged) return;
+      _frameLogged = true;
+      firstFrame = true;
+      firstFrameMs = _frameSw.isRunning ? _frameSw.elapsedMilliseconds : null;
+      _frameSw.stop();
+      trace('player.firstframe', '${v.dw}x${v.dh} +${firstFrameMs ?? '-'}ms');
+      _notify();
+    }));
+    _subs.add(player.stream.playing.listen((v) {
+      if (_disposed) return;
+      if (v) trace('player.playing');
+      playing = v;
+      _notify();
+    }));
+    _subs.add(player.stream.buffering.listen((v) {
+      if (_disposed) return;
+      buffering = v;
+      _notify();
+    }));
+    _subs.add(player.stream.duration.listen((v) {
+      if (_disposed) return;
+      duration = v;
+      durationOut.value = v;
+      _notify();
+      // 注意：这里**不要**顺手 seek 到 startAt。HLS 的 demuxer 在 duration
+      // 刚就绪时还会 reload 一次 playlist，此刻 seek 必被冲掉，位置掉回片头，
+      // 而且 `state.position` 会先「假报」目标值，把续播校验也骗过去。
+      // seek 统一交给 _resumeTo()：等流真的跑起来再跳。
+    }));
+    _subs.add(player.stream.position.listen((v) {
+      position = v;
+      // 弹幕层靠这个值对齐时间轴；它不触发整树 rebuild
+      positionOut.value = v;
+      _maybeSkipTail(v);
+    }));
+    _subs.add(player.stream.completed.listen((v) {
+      if (_disposed) return;
+      if (v) {
+        completed = true;
+        _notify();
+      }
+    }));
+    // 调试用：把 mpv 原生日志整体转进 logcat。
+    // `stream.error` 只透传部分 prefix 的 error 行、且**不带 prefix** ——
+    // 光看一句 "Could not open codec." 分不清是视频还是音频解码器起不来。
+    if (kDebugMode) {
+      _subs.add(player.stream.log.listen((l) {
+        if (l.level == 'error' || l.level == 'warn') {
+          // `_setProperty(osc, 1)` 是 media_kit 无条件设 osc 造成的噪音
+          //（当前 libmpv 构建没编 OSC），无害，别让它盖住真正的报错。
+          if (l.text.contains('_setProperty(osc')) return;
+          debugPrint('[mpv/${l.prefix}/${l.level}] ${l.text}');
+        }
+      }));
+    }
+
+    _subs.add(player.stream.error.listen((e) {
+      if (_disposed) return;
+      _onStreamError(e);
+    }));
+  }
+
+  /// 硬解降级判定的**唯一入口**：真实 `stream.error` 与故障注入都走这里。
+  ///
+  /// 抽成方法而不是留在 `listen` 闭包里，是为了让
+  /// `--dart-define=FORCE_HWDEC_FAIL_MS` 的注入能复用同一条判定链
+  /// （`_isCodecFailure` → `_degraded` → `_rebuildAsSoftware`），
+  /// 否则注入只能绕过判定直接调重建，验证的就是另一条路径了。
+  void _onStreamError(String e) {
+    if (_disposed) return;
+    debugPrint('[player] error: $e');
+    // 硬解起不来（MediaCodec 拿不到 AndroidSurface）就自动降级软解重来一次。
+    if (_hwdec && !_degraded && _isCodecFailure(e)) {
+      _degraded = true;
+      unawaited(_rebuildAsSoftware());
+      return;
+    }
+    errorOut.value = true;
+    error = e;
+    buffering = false;
+    _notify();
+  }
+
+  /// 按 `--dart-define=FORCE_HWDEC_FAIL_MS` 安排一次伪解码失败。
+  ///
+  /// 每次 `_open()` 成功后重新计时：注入点必须落在「流已经跑起来、
+  /// 位置已越过 3 秒」之后，否则会被 [startAtAfterRebuild] 的
+  /// `> 3s` 门槛挡掉（那是刻意的设计，测不到接盘就白测）。
+  void _armFaultHwdecFail() {
+    if (!kDebugMode || _faultHwdecFailMs <= 0) return;
+    _faultTimer?.cancel();
+    _faultTimer = Timer(Duration(milliseconds: _faultHwdecFailMs), () {
+      _faultTimer = null;
+      if (_disposed || !_hwdec || _degraded) return;
+      debugPrint('[player] FAULT inject hwdec fail '
+          '(dart-define=$_faultHwdecFailMs ms, pos=$position)');
+      _onStreamError('Could not open codec. (FAULT-INJECTED)');
+    });
+  }
+
+  // ---------- surface ----------
+
+  /// media_kit_video 的原生通道（与包内同名同实例约定，用于直接指挥 Surface）。
+  static const MethodChannel _mkChannel =
+      MethodChannel('com.alexmercerind/media_kit_video');
+
+  /// 原生 surface 是否真的可以交给 mpv 用。
+  ///
+  /// **不能拿 `VideoController.id` 当判据** —— 实测它会先被赋成 `0`
+  ///（`surface ready id=0`，Flutter 引擎此时还没把 texture id 交回来），
+  /// 而真正决定 `vo` 取值的是 `AndroidVideoController.wid`：
+  ///   `wid == 0` ⇒ `vo = null` ⇒ mpv 没有 native_window
+  bool get _surfaceReady {
+    final pf = controller.notifier.value;
+    if (pf is AndroidVideoController) {
+      final w = pf.wid.value;
+      return w != null && w != 0;
+    }
+    // 非 Android（桌面/其它实现）退回 id 判据
+    return controller.id.value != null;
+  }
+
+  String get _surfaceDebug {
+    final pf = controller.notifier.value;
+    if (pf is AndroidVideoController) {
+      return 'wid=${pf.wid.value} id=${pf.id.value} rect=${pf.rect.value} '
+          'vo=${pf.configuration.vo} hwdec=${pf.configuration.hwdec}';
+    }
+    return 'platform=${pf.runtimeType} id=${controller.id.value}';
+  }
+
+  /// 主动把 native `SurfaceProducer` 的 surface 创建出来（**起播链的第一环**）。
+  ///
+  /// media_kit_video 1.3.1 的真实时序：
+  ///   `VideoController()` → 首帧后 `AndroidVideoController.create()`
+  ///     → `VideoOutputManager.Create()`（只是 new VideoOutput 对象）
+  ///     → `platform.complete()`  ← 到这里**还没有 surface**
+  /// 而 `VideoOutput.onSurfaceAvailable()`（唯一给 `id`/`wid` 赋值的地方）
+  /// 只在 `SurfaceProducer.setSize()` 之后被回调；Dart 侧唯一触发
+  /// `SetSurfaceSize` 的路径是 `player.stream.videoParams` 监听 ——
+  /// 也就是必须先解出一帧。于是死锁：hwdec 要 surface 才能起 mediacodec，
+  /// surface 要 videoParams（要先解出帧）才会被创建。
+  /// 打破死锁：自己按播放器像素尺寸调一次 `SetSurfaceSize`，
+  /// 逼原生走 `setSize() → onSurfaceAvailable()`，`id`/`wid` 立刻回填。
+  Future<void> _ensureSurface() async {
+    try {
+      final p = player.platform;
+      if (p is! NativePlayer) return;
+      final handle = await p.handle;
+      if (_disposed) return;
+
+      // 尺寸只用来建 surface。**优先用视频真实尺寸**（master 的 RESOLUTION，
+      // 见 [videoSizeHint]）：预置正确 ⇒ 首帧 `videoParams` 命中 `isSame`
+      // 早退 ⇒ 不发生 `VideoOutput.Resize`/`widListener`/`seek(0)` 那套重建。
+      // 拿不到真实尺寸才退回「渲染器逻辑尺寸 × dpr」，并靠
+      // [_bindStreams] 的重建感知把海报补回去。
+      final hint = videoSizeHint;
+      var w = hint?.width.round() ?? (surfaceHint.width * devicePixelRatio).round();
+      var h = hint?.height.round() ?? (surfaceHint.height * devicePixelRatio).round();
+      if (w <= 0 || h <= 0) {
+        w = 1280;
+        h = 720;
+      }
+      w = w.clamp(64, 3840);
+      h = h.clamp(64, 3840);
+
+      await _mkChannel.invokeMethod('VideoOutputManager.SetSurfaceSize', {
+        'handle': handle.toString(),
+        'width': w.toString(),
+        'height': h.toString(),
+      });
+      trace('player.surface.size', '${w}x$h src=${hint != null ? 'master' : 'widget'}');
+      debugPrint('[player] surface pre-created ${w}x$h handle=$handle');
+    } catch (e) {
+      debugPrint('[player] surface pre-create failed: $e');
+    }
+  }
+
+  /// 等 AndroidSurface 真正挂上再 `open()`。
+  ///
+  /// `id` 与 `wid` 是同一个原生回调里赋的值，拿它当「surface 就绪」信号。
+  Future<void> _openWhenSurfaceReady() async {
+    final sw = Stopwatch()..start();
+
+    // master 解析在构造函数里就已经踢出去了（见 `unawaited(_directUrlOf(url))`）。
+    // `#39` 第二层：`_ensureSurface()` 必须拿到真实分辨率再建 surface，
+    // 所以这里把它和 platform.future **并行等齐**，谁慢等谁 ——
+    // 串行 await 会白赔一次 CDN 的 TTFB（实测 1.24s）。
+    final masterFut = _directUrlOf(url);
+
+    // platform.future 完成 = VideoOutputManager.Create + setProperties 已落地，
+    // 此时才有 VideoOutput 对象可以 setSurfaceSize。
+    try {
+      await controller.platform.future.timeout(const Duration(seconds: 5));
+    } catch (e) {
+      debugPrint('[player] controller platform timeout: $e');
+    }
+    trace('player.platform.done');
+    if (_disposed) return;
+
+    try {
+      await masterFut.timeout(const Duration(seconds: 4));
+    } catch (e) {
+      // 拿不到就按 widget 尺寸建，后面靠重建感知兜底，不阻塞起播
+      debugPrint('[player] master parse timeout: $e');
+    }
+    trace('player.size.hint', '${videoSizeHint ?? '-'} sw=${sw.elapsedMilliseconds}ms');
+    if (_disposed) return;
+
+    await _ensureSurface();
+    trace('player.surface.req');
+
+    while (!_disposed && !_surfaceReady) {
+      if (sw.elapsed > const Duration(seconds: 4)) {
+        debugPrint('[player] surface wait timeout, open anyway | $_surfaceDebug');
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+    }
+    if (_disposed) return;
+    if (_surfaceReady) {
+      debugPrint(
+          '[player] surface ready in ${sw.elapsedMilliseconds}ms | $_surfaceDebug');
+      // widListener 走 lock.synchronized + 三次 setProperty 往返
+      //（vo=null → android-surface-size/wid/vo=gpu），wid 赋值与 vo 真正生效
+      // 之间还有一段窗口，给 200ms 落定，否则 open 的瞬间 vo 仍是 null。
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    trace('player.surface.ready', 'sw=${sw.elapsedMilliseconds}ms');
+    if (_disposed) return;
+    // setProperty 必须在 open 之前落地（见 `_optsReady` 注释）
+    try {
+      await _optsReady;
+    } catch (_) {}
+    if (_disposed) return;
+    debugPrint('[player] open now | $_surfaceDebug');
+    await _open();
+    // open 之后再打一次：mpv 处理完 --wid 之后的值才是解码器看到的。
+    Future<void>.delayed(const Duration(milliseconds: 800), () {
+      if (!_disposed) debugPrint('[player] after open | $_surfaceDebug');
+    });
+  }
+
+  static bool _isCodecFailure(String e) {
+    final s = e.toLowerCase();
+    return s.contains('codec') ||
+        s.contains('mediacodec') ||
+        s.contains('surface');
+  }
+
+  /// 硬解失败 → 用软解把整套会话重建一遍并重开。
+  Future<void> _rebuildAsSoftware() async {
+    debugPrint('[player] hwdec failed → rebuild with software decode');
+    // ★ 重建会 `player.dispose()`，位置状态随之销毁。崩之前用户已经看到的位置
+    //   必须**先捞出来**塞回 `startAt`：`_open()` 里 `startAt = null` 是一次性
+    //   消费（换线/重试不能又跳回入口位置），重建走的是**新的一次** `_open()`，
+    //   拿不到旧值 ⇒ `seekTo=null` ⇒ 从 0 播。
+    //   实测 `run8.log`：11:00:04 硬解崩重建 ⇒ `opened url, seekTo=null`，
+    //   用户看到的是「看了 16 分钟，闪一下，回到片头」。
+    final resumeFrom = player.state.position;
+    // 拉黑到进程级：后续新会话（换集退出重进 / 点别的片）直接软解，
+    // 不再每路流都黑屏 1~2 秒。
+    hwdecUnavailable = true;
+    trace('player.hwdec.fail', 'blacklisted=1');
+    _progressTimer?.cancel();
+    // ★ 旧哨兵必须在这里撤掉。`_watchAfterResume` 的 Timer 闭包里捕获的是
+    //   **重建前那次** `_resumeTo` 的目标 `s`（如 0:02:24），它只看
+    //   `player.state.position`——重建后 `position` 归零，2 秒后旧哨兵必然判定
+    //   「掉回片头」并 `re-seek 0:02:24`；与此同时新 `_open()` 已经用
+    //   `startAt=0:02:33` 起了**另一条** `_resumeTo`。两条 seek 链互相把对方
+    //   的落点当成 drift，各自重试。
+    //   实测 `run16.log`：5320 行 `fell back to 0:00:00, re-seek 0:02:24 (fix=1)`
+    //   → 5726 行 `seek drift round=0 k=0` → 拖到 5968 行才收敛到 2:33，
+    //   用户看到画面回跳一次、多花约 13 秒。
+    _resumeWatch?.cancel();
+    _resumeWatch = null;
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _subs.clear();
+    try {
+      await player.dispose();
+    } catch (_) {}
+    if (_disposed) return;
+    _hwdec = false;
+    error = null;
+    completed = false;
+    buffering = true;
+    playing = false;
+    position = Duration.zero;
+    duration = Duration.zero;
+    _resumeFix = 0;
+    positionOut.value = Duration.zero;
+    durationOut.value = Duration.zero;
+    errorOut.value = false;
+    // 3 秒以内不值得补：那多半是刚起播就崩，硬解降级本身要 1~2 秒，
+    // 再为「片头 3 秒」多等一轮 warm-up 反而更慢。
+    final keep = startAtAfterRebuild(resumeFrom);
+    if (keep != null) {
+      startAt = keep;
+      debugPrint('[player] rebuild keeps position $keep');
+    }
+    // 新 controller → 渲染器重建 `Video`（`controller` 变了必须重画）
+    _createPlayer();
+    _notify();
+    _started = false; // 让 start() 重新绑流 + 重新等 surface + 重新 open
+    start();
+  }
+
+  // ---------- 开流 ----------
+
+  /// 换地址：在**同一个 native 实例**上重新 `open()`（不重建解码器）。
+  ///
+  /// 与河豚一致（`PlPlayerController.setDataSource` 复用 `Player`），
+  /// 也与 #32「换集串音」的修法同一原则：换 key 会让旧 Player 到帧末才
+  /// dispose、新实例已经抢了声卡，中间那段两路音频同时响。
+  Future<void> openUrl(String url, {Duration? startAt}) async {
+    if (_disposed) return;
+    this.url = url;
+    this.startAt = startAt;
+    _resetPlaybackState();
+    // 还没有渲染器挂上来（没 `start()` 过）：交给 start() 一并开流
+    if (!_started) return;
+    await _open();
+  }
+
+  /// 换集/换线/重试前的状态归零（UI 立刻回到「缓冲中」）。
+  void _resetPlaybackState() {
+    error = null;
+    completed = false;
+    buffering = true;
+    playing = false;
+    position = Duration.zero;
+    duration = Duration.zero;
+    // `#39`：新一集/新线路的首帧还没到，海报必须重新挂上
+    firstFrame = false;
+    firstFrameMs = null;
+    _frameLogged = false;
+    _resumeFix = 0;
+    // 片尾哨兵必须复位：否则第 1 集跳完片尾，第 2 集到尾也不会再跳
+    _tailFired = false;
+    errorOut.value = false;
+    positionOut.value = Duration.zero;
+    durationOut.value = Duration.zero;
+    _notify();
+  }
+
+  /// 片尾跳过（`ROADMAP.md` #52 片头尾面板）。
+  ///
+  /// 判据是**「距结尾还剩 `skipTail`」**，不是绝对位置 —— 每集时长不同，
+  /// 用绝对位置在 45 分钟的正片和 3 分钟的预告上表现完全不一样。
+  ///
+  /// 触发后先撤哨再回调：回调里页面会 `openUrl()` 换下一集，
+  /// 而那会走 [_resetPlaybackState] 复位哨兵；两处都复位是刻意的冗余，
+  /// 但**回调前必须自己置位**，否则 position 流在换集的空档里还会再触发一次
+  ///（出现「连跳两集」）。
+  void _maybeSkipTail(Duration pos) {
+    if (_disposed || _tailFired) return;
+    final sk = skipTail;
+    if (sk <= Duration.zero) return;
+    final dur = duration;
+    if (dur <= sk + const Duration(seconds: 1)) return;
+    if (pos < dur - sk) return;
+    _tailFired = true;
+    trace('player.skip.tail', 'pos=$pos dur=$dur skip=$sk');
+    final cb = onTailReached;
+    if (cb != null) {
+      cb();
+    } else {
+      // 没人接「下一集」：跳到结尾让 `completed` 自然触发，显示出重播按钮
+      unawaited(seek(dur));
+    }
+  }
+
+  Future<void> _open() async {
+    // 重新拉流 = 退出错误态，弹幕层要跟着回来
+    errorOut.value = false;
+    // 连点选集时 `_open()` 会被接连调用，只认最后一次的结果
+    final seq = ++_openSeq;
+    try {
+      _resumeFix = 0;
+      // **先停掉正在播的这路，再 open 新的。**
+      // `open()` 落到 libmpv 是一次 `loadfile replace`，不是原子的：
+      // 新流的 audio 输出已经开始出声、旧流的还没拆干净，中间那一小段
+      // 就是两路声音叠着响 —— 用户反馈的「切集串音」。
+      try {
+        player.pause();
+      } catch (_) {}
+      // 起播提速 ②：给 mpv 的是**剥掉 master 之后**的地址（见 `_directUrlOf`）
+      final target = await _directUrlOf(url);
+      if (seq != _openSeq || _disposed) return;
+      // `#39` 空窗量测起点：从真正发出 loadfile 这一刻算，不含 master 探测耗时
+      _frameSw
+        ..reset()
+        ..start();
+      trace('player.open.call', 'seq=$seq');
+      await player.open(Media(target), play: true);
+      if (seq != _openSeq || _disposed) return;
+      // 故障注入（默认关）：真机验证 `_rebuildAsSoftware` 的唯一手段，
+      // 见 `_faultHwdecFailMs` 上的说明。
+      _armFaultHwdecFail();
+      // #52 片头跳过：**只在没有续播位置时**生效。
+      // 续播（`startAt != null`）优先 —— 用户上次看到 12:30，不能被片头跳过
+      // 拽回第 90 秒。两者共用同一条 seek 校验链路（`_resumeTo` 会等流跑起来
+      // 再跳 + 连续采样防 HLS 丢位置），所以这里只是决定「跳哪儿」。
+      final skip = skipHead > Duration.zero ? skipHead : null;
+      final s = startAt ?? skip;
+      // 只消费一次：换线/重试不能再跳回入口位置
+      startAt = null;
+      trace('player.open.done', 'seq=$seq');
+      debugPrint('[player] opened url, seekTo=$s (skipHead=$skipHead)');
+      if (s == null || s <= const Duration(seconds: 3)) return;
+      await _resumeTo(s);
+    } catch (e) {
+      if (_disposed || seq != _openSeq) return;
+      error = Api.friendly(e);
+      _notify();
+    }
+  }
+
+  /// 复用当前实例重试（不重建 native，避免 dispose/init 竞争导致崩溃）
+  Future<void> retry() async {
+    if (_disposed) return;
+    _resetPlaybackState();
+    await _open();
+  }
+
+  /// 只把错误态撤掉（点「重试/切换线路」时先让错误浮层消失，
+  /// 真正的重开由调用方决定走 `retry()` 还是换一条线路）
+  void dismissError() {
+    if (_disposed) return;
+    if (error == null && errorOut.value == false) return;
+    error = null;
+    errorOut.value = false;
+    _notify();
+  }
+
+  // ---------- 播放控制 ----------
+
+  void playOrPause() {
+    if (_disposed) return;
+    player.playOrPause();
+  }
+
+  void pause() {
+    if (_disposed) return;
+    try {
+      player.pause();
+    } catch (_) {}
+  }
+
+  void play() {
+    if (_disposed) return;
+    try {
+      player.play();
+    } catch (_) {}
+  }
+
+  /// 暂停/恢复由外层决定是否要顺带重排控制条隐藏（那是 UI 的事）
+  bool get isPlaying => playing;
+
+  Future<void> seek(Duration d) async {
+    if (_disposed) return;
+    try {
+      await player.seek(d);
+    } catch (_) {}
+  }
+
+  Future<void> replay() async {
+    await seek(Duration.zero);
+    play();
+    completed = false;
+    _notify();
+  }
+
+  void setVolume(double v) {
+    if (_disposed) return;
+    try {
+      player.setVolume(v);
+    } catch (_) {}
+  }
+
+  /// 设置倍速（`ROADMAP.md` #52 倍速面板）。
+  ///
+  /// 落盘是页面的事（`Settings.setPlaybackRate`）；这里只保证
+  /// 「引擎真的按这个速率在跑」。`player.setRate` 对 `media_kit` 是
+  /// `setProperty('speed')`，对 HLS/软解都生效。
+  void setRate(double v) {
+    if (_disposed) return;
+    if (v <= 0) return;
+    rate = v;
+    try {
+      player.setRate(v);
+    } catch (_) {}
+    trace('player.rate', '$v');
+  }
+
+  /// 设置缓冲时长（秒，`ROADMAP.md` #52 缓冲设置面板）。
+  ///
+  /// 河豚三档 `60/120/300`，落成 mpv 的 `cache-secs`。
+  /// 这个属性 mpv 是**每条 loadfile 时读一次**（和 `demuxer-lavf-*` 同类），
+  /// 所以：① 记进字段，`_applyPlayerOptions` 会在每次重建 Player 时落一次；
+  /// ② 当场也落一次，让「已开着的这路」从下一次起播开始按新值缓冲。
+  Future<void> applyBuffer(int secs) async {
+    if (_disposed) return;
+    if (secs <= 0) return;
+    bufferSecs = secs;
+    try {
+      final p = player.platform;
+      if (p is NativePlayer) {
+        await p.setProperty('cache-secs', '$secs');
+        trace('player.buffer', 'cache-secs=$secs');
+      }
+    } catch (_) {}
+  }
+
+  /// 从指定位置接着播（换渲染器/外部续播用）
+  Future<void> seekTo(Duration d) async {
+    if (_disposed || d <= Duration.zero) return;
+    try {
+      await player.seek(d);
+      await player.play();
+    } catch (_) {}
+  }
+
+  /// 起播后跳到指定位置（换线路/续播共用）。
+  ///
+  /// HLS 的坑（实测踩过）：刚 `open()` 完就 seek，mpv 会「接受」并让
+  /// `state.position` 立刻跳到目标值，但 demuxer reload playlist 之后又从 0 播
+  /// —— 日志上写着 resume ok，画面却回到片头。所以顺序必须是：
+  ///   1) 等流真正跑起来（duration 就绪 + position 开始前进）
+  ///   2) 再 seek，然后连续采样校验；位置掉了就重新 seek
+  Future<void> _resumeTo(Duration s, {int attempt = 0}) async {
+    // 续播是个「等 15 秒 + 反复试」的长流程，中途用户可能已经换了集。
+    // 一旦 url 变了就立刻收手，否则旧集的 seek 会把新流拖回旧位置。
+    final url0 = url;
+    // 发起时的 open 序号快照。硬解降级会**同 URL 重新 open**（ 一字未变），
+    // 位置却归零 —— 光比  拦不住，会把归零当成 drift 白打 5 轮 seek
+    //（实测  11:00:05~11:00:07：drift round 0..4 全 pos=0:00:00
+    //  →  → 回片头）。序号变了就说明这轮作废，立刻收手。
+    final seq0 = _openSeq;
+    var warmed = false;
+    for (var i = 0; i < 30; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (_disposed || url != url0 || _openSeq != seq0) return;
+      final p = player.state.position;
+      final d = player.state.duration;
+      // 位置真的往前走了 3 秒以上、且时长已就绪，才算「流跑起来了」
+      if (p > const Duration(seconds: 3) && d > s) {
+        warmed = true;
+        debugPrint('[player] warm at $p dur=$d');
+        break;
+      }
+    }
+    if (!warmed) {
+      debugPrint('[player] warm-up timeout, pos=${player.state.position}');
+    }
+    // HLS 只能从关键帧（切片边界）起播，seek 到 s 实际会落到 s 之后的下一个
+    // 关键帧上，实测常偏 +2~4s。所以往前多要 1 秒，让落点落在 s 附近。
+    final seekTo = s > const Duration(seconds: 5)
+        ? s - const Duration(seconds: 1)
+        : s;
+    for (var round = 0; round < 5; round++) {
+      await player.seek(seekTo);
+      debugPrint('[player] seek#$round -> $seekTo (target $s, attempt $attempt)');
+      var ok = true;
+      var first = Duration.zero;
+      var prev = Duration.zero;
+      // 采样窗口内位置**有没有过任何一次前进**。判 frozen 只看这个，不看幅度。
+      // HLS 首次 seek 后 demuxer 要重建 mediacodec，实测 5 秒只推进 400ms
+      //（`run5.log` 09:54:27.052 → 09:54:32.111，913.103 − 912.703）；
+      // 旧版按「≥600ms」判幅度，把这种正常慢启动当成冻结，白跑一轮 seek。
+      var moved = false;
+      for (var k = 0; k < 10; k++) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        if (_disposed || url != url0 || _openSeq != seq0) return;
+        final p = player.state.position;
+        if (k == 0) {
+          first = p;
+        } else if (p > prev) {
+          moved = true;
+        }
+        prev = p;
+        // 掉回目标之前（HLS reload 把位置丢回片头）→ 失败
+        if (p < s - const Duration(seconds: 2)) {
+          ok = false;
+          debugPrint('[player] seek drift round=$round k=$k pos=$p target=$s');
+          break;
+        }
+        // 已经明显越过目标，说明确实在往前播，收工
+        if (p > s + const Duration(seconds: 10)) break;
+      }
+      final p = player.state.position;
+      // 「假成功」：位置从头到尾**一个微秒都没动**（画面还没真解出来）。
+      // 慢 ≠ 冻 —— 判据细节与实测数据见 `seek_guard.dart`。
+      if (ok && seekLooksFrozen(moved: moved, pos: p, target: s)) {
+        ok = false;
+        debugPrint('[player] seek frozen at $p '
+            '(first=$first, moved=$moved), retry');
+      }
+      if (ok) {
+        // first 才是真正的落点（第一帧采样），验收时看 first 和 target 的差
+        debugPrint('[player] resume ok at $p (landed $first, target $s, '
+            'round $round, attempt $attempt)');
+        _watchAfterResume(s);
+        return;
+      }
+    }
+    debugPrint('[player] resume gave up, pos=${player.state.position}');
+    // 放弃续播时千万别把画面留在目标位置上：mpv 会停在那儿一动不动，
+    // 用户看到的是一张静止的画面，以为播放器卡死了。退回从头播，至少有的看。
+    try {
+      await player.seek(Duration.zero);
+      await player.play();
+      debugPrint('[player] fallback to start after giving up');
+    } catch (_) {}
+  }
+
+  /// 续播后复核：HLS 源偶发「seek 成功几秒后 demuxer reload、位置掉回片头」，
+  /// 实测「高清·本站」在 5 分钟处会连续掉两次，所以不是一次性检查，
+  /// 而是每 2 秒盯一次、最多补 3 次 seek；补到 3 次还掉就认命
+  ///（有的源根本不支持 seek，无限重试只会让画面一直卡）。
+  void _watchAfterResume(Duration s) {
+    if (s <= const Duration(seconds: 10)) return;
+    _resumeWatch?.cancel();
+    var checks = 0;
+    _resumeWatch = Timer.periodic(const Duration(seconds: 2), (t) {
+      if (_disposed) {
+        t.cancel();
+        return;
+      }
+      checks++;
+      final p = player.state.position;
+      if (p < const Duration(seconds: 3)) {
+        t.cancel();
+        if (_resumeFix >= 3) {
+          debugPrint('[player] fell back to $p again, give up (fix=$_resumeFix)');
+          return;
+        }
+        _resumeFix++;
+        debugPrint('[player] fell back to $p, re-seek $s (fix=$_resumeFix)');
+        _resumeTo(s, attempt: _resumeFix);
+        return;
+      }
+      // 已经稳稳越过目标，或者盯了 30 秒都正常 → 撤哨
+      if (p > s + const Duration(seconds: 15) || checks > 15) t.cancel();
+    });
+  }
+
+  // ---------- 销毁 ----------
+
+  @override
+  void dispose() {
+    if (_disposed) {
+      super.dispose();
+      return;
+    }
+    // 最后一次进度：页面退出那一刻的位置也要落盘（原来在 widget.dispose 里做）
+    try {
+      onProgress?.call(position, duration);
+    } catch (_) {}
+    _disposed = true;
+    _progressTimer?.cancel();
+    _progressTimer = null;
+    _resumeWatch?.cancel();
+    _resumeWatch = null;
+    _faultTimer?.cancel();
+    _faultTimer = null;
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _subs.clear();
+    // 先同步 pause 再 dispose：`dispose()` 是异步收敛的（mpv 销毁要几帧），
+    // 不等 pause 会有一小段「声音还在响」。
+    try {
+      player.pause();
+    } catch (_) {}
+    player.dispose();
+    if (_ownsPositionOut) positionOut.dispose();
+    if (_ownsDurationOut) durationOut.dispose();
+    if (_ownsErrorOut) errorOut.dispose();
+    super.dispose();
+  }
+}
+
+/// HLS master 一次解析的产物：真正有分片的地址 + 视频真实像素尺寸。
+///
+/// `#39` 第二层：`res` 是从 `#EXT-X-STREAM-INF:...RESOLUTION=WxH` 取的，
+/// 是**起播前唯一**能拿到的真实分辨率；`null` 表示这源没写（或不是 master），
+/// 调用方退回「渲染器尺寸 × dpr」并依赖首帧重建感知兜底。
+@immutable
+class _MasterInfo {
+  const _MasterInfo(this.url, this.res);
+
+  /// 给 mpv 的地址（已剥掉 master 那一跳）。
+  final String url;
+
+  /// 视频真实像素尺寸（`null` = 未知）。
+  final Size? res;
+}

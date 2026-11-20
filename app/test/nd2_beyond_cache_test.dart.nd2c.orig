@@ -1,0 +1,138 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:haitun_app/core/playback_session.dart';
+
+/// `#82` ND-2 判据锁：`PlaybackSession.isBeyondCache`。
+///
+/// 这条判据的职责只有一个 —— 在**报错流永不静默**的前提下，仍然能认出
+/// 「播放真的恢复了」。所以每个用例都要回答同一个问题：
+///   同样的 `pos - errAt`，旧判据（只有 `quiet` 一条路）判成什么，
+///   新判据（加物理上限）判成什么。
+///
+/// 物理量：`cache-secs` = 缓冲上限，断流后本地缓存最多再推这么多秒。
+/// 越过它的内容只可能来自网络。数值取河豚三档 60 / 120 / 300。
+void main() {
+  Duration s(int sec, [int ms = 0]) =>
+      Duration(seconds: sec, milliseconds: ms);
+
+  group('cacheSecsOf：档位归一', () {
+    test('三档原样返回', () {
+      expect(PlaybackSession.cacheSecsOf(60), 60);
+      expect(PlaybackSession.cacheSecsOf(120), 120);
+      expect(PlaybackSession.cacheSecsOf(300), 300);
+    });
+
+    test('<=0 回落默认 60（对应 _applyPlayerOptions 的同一回落）', () {
+      expect(PlaybackSession.cacheSecsOf(0), 60);
+      expect(PlaybackSession.cacheSecsOf(-1), 60);
+    });
+  });
+
+  group('isBeyondCache：真值表', () {
+    // 行 1：刚报错被冻住 —— 前进 0，任何档都不越界
+    test('行1 pos==errAt：不越界（60 档）', () {
+      expect(PlaybackSession.isBeyondCache(s(10), s(10), 60), isFalse);
+    });
+
+    // 行 2 / 行 6：仍在物理上限内 ⇒ 保守，不越界（这一行是整个改动的安全边界）
+    test('行2 前进 30s < 60 档：不越界（可能只是烧缓存）', () {
+      expect(PlaybackSession.isBeyondCache(s(130), s(100), 60), isFalse);
+    });
+
+    test('行6 前进 200s < 300 档：不越界（高档缓冲下不抢跑）', () {
+      expect(PlaybackSession.isBeyondCache(s(300), s(100), 300), isFalse);
+    });
+
+    // 行 5：`_n1_t6` 现场 —— 遮罩已上屏，position 仍推进 113s
+    test('行5 前进 113s > 60 档：越界 ⇒ 必为真恢复', () {
+      expect(PlaybackSession.isBeyondCache(s(113), s(0), 60), isTrue);
+    });
+
+    test('行5b 前进 866s（run3.log:2880 实测 errAt=2:23 → pos=16:49）', () {
+      expect(PlaybackSession.isBeyondCache(s(16 * 60 + 49), s(2 * 60 + 23), 60),
+          isTrue);
+    });
+
+    test('行5c 同一起点换 120 / 300 档：仍越界（113s 跨过 120？否）', () {
+      // 113 < 120 ⇒ 120 档不越界；这正说明判据随档位缩放
+      expect(PlaybackSession.isBeyondCache(s(113), s(0), 120), isFalse);
+      expect(PlaybackSession.isBeyondCache(s(113), s(0), 300), isFalse);
+      // 而 121s 在 120 档下越界
+      expect(PlaybackSession.isBeyondCache(s(121), s(0), 120), isTrue);
+    });
+  });
+
+  group('isBeyondCache：边界（严格大于，不是大于等于）', () {
+    test('恰好等于上限 ⇒ 不越界', () {
+      expect(PlaybackSession.isBeyondCache(s(60), s(0), 60), isFalse);
+      expect(PlaybackSession.isBeyondCache(s(300), s(0), 300), isFalse);
+    });
+
+    test('上限 +1ms ⇒ 越界', () {
+      expect(PlaybackSession.isBeyondCache(s(60, 1), s(0), 60), isTrue);
+    });
+
+    test('position 回退（重连后归零）⇒ 负数，不越界', () {
+      // 实测 13:22:15.514 recover firstframe pos=0:00:00.000000 errAt=0:00:04.298500
+      expect(PlaybackSession.isBeyondCache(s(0), s(4, 298), 60), isFalse);
+    });
+  });
+
+  group('新旧判据对照（同一组数据）', () {
+    /// 旧判据复刻：只有 quiet 一条路，且要求前进 > 1s。
+    /// 这里用 `quiet=false` 模拟「ND-1 报错风暴持续刷新 _errAtWall」的真实场景。
+    bool oldRule(Duration pos, Duration errAt,
+            {required bool quiet, required bool buffering}) =>
+        quiet && !buffering && pos > errAt + const Duration(seconds: 1);
+
+    test('_n1_t6 现场：旧判据 false / 新判据 true', () {
+      final pos = s(113), errAt = s(0);
+      expect(oldRule(pos, errAt, quiet: false, buffering: false), isFalse,
+          reason: '报错风暴把 quiet 打在 false ⇒ 旧判据永久失能，这就是 113s 挂死');
+      expect(PlaybackSession.isBeyondCache(pos, errAt, 60), isTrue,
+          reason: '越过 60s 物理上限 ⇒ 新判据放行');
+    });
+
+    test('烧缓存现场：新旧一致判 false（安全边界没被削）', () {
+      final pos = s(30), errAt = s(0);
+      expect(oldRule(pos, errAt, quiet: false, buffering: false), isFalse);
+      expect(PlaybackSession.isBeyondCache(pos, errAt, 60), isFalse);
+    });
+
+    test('网络真恢复 + 静默满足：新旧都 true（老出口没被破坏）', () {
+      final pos = s(30), errAt = s(0);
+      expect(oldRule(pos, errAt, quiet: true, buffering: false), isTrue);
+      // 新代码里这条仍走 `position-forward` 分支，`beyondCache` 只是并集的一项
+      expect(PlaybackSession.isBeyondCache(pos, errAt, 60), isFalse);
+    });
+  });
+
+  group('结构性上界：整体断网永远够不到判据（b1-c 实测反推）', () {
+    // 物理账（两处同一常量）：
+    //   `:478` 把 `bufferSecs` 落成 mpv 的 `cache-secs`（缓冲的物理上限）；
+    //   `:707` 拿**同一个** `bufferSecs` 当判据阈值。
+    // ⇒ 整体断网时 demuxer 只能把缓存烧完，position 前进量 ≤ cache-secs，
+    //   而判据要求**严格大于** cache-secs ⇒ 整网断下结构性不可达。
+    //   唯一能跨过的形态是「在途余量」：缓存已满但仍在收字节 ⇒ 网络部分通。
+    // 这一组不是文字表述，是把 b1-c 的失败原因钉成回归项 —— 谁哪天把阈值
+    // 写成 `>=` 或换了别的常量，这里立刻红。
+    for (final tier in [60, 120, 300]) {
+      test('$tier 档：烧满缓存（前进 == 上限）⇒ 不越界', () {
+        expect(PlaybackSession.isBeyondCache(s(tier), s(0), tier), isFalse);
+      });
+    }
+
+    test('唯一能跨过的形态：在途余量（上限已满仍在收字节）', () {
+      // 前进 65s / 60 档：多出的 5s 只可能来自「网络还在给字节」= 部分通路。
+      // b1-c 想用 wifi 开关造这个状态，实测造不出来（见 VERIFICATION §4b.3）。
+      expect(PlaybackSession.isBeyondCache(s(65), s(0), 60), isTrue);
+    });
+
+    test('实测标定值：b1 断网 5s 前进 5.04s ⇒ 远在上界之内', () {
+      // 逐字取自 r1b_b1_5s.log:13:34:36.961
+      //   pos=0:02:08.663222 errAt=0:02:03.623222
+      final pos = s(128, 663), errAt = s(123, 623);
+      expect(pos - errAt, const Duration(seconds: 5, milliseconds: 40));
+      expect(PlaybackSession.isBeyondCache(pos, errAt, 60), isFalse);
+    });
+  });
+}

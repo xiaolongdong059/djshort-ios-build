@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动画面底色 = logo 同款米色 #FCFCF0。深蓝描边的兔子在米底上完整显形；
+         之前的近黑底会把描边糊掉。 -->
+    <color name="splash_bg">#FFFCFCF0</color>
+</resources>

@@ -1,0 +1,112 @@
+name: Build iOS Unsigned IPA
+
+# 产出「未签名 IPA」：不需要 Mac 本机。签名在 Windows 侧用 Sideloadly + Apple ID 完成。
+# 为什么发 Release 而不是 artifact：
+#   GitHub 的 artifact 存储配额（500MB/账号）早被旧项目占满，上传会直接失败
+#   （2026-11-18 首次运行就栽在「上传产物」，编译与打包其实都成功了）。
+#   Release 资产不计入 artifact 配额，所以改成发 Release，本地用 API/gh 取。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'app/lib/**'
+      - 'app/ios/**'
+      - 'app/pubspec.yaml'
+      - '.github/workflows/ios-unsigned.yml'
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境自检
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.8'
+          channel: stable
+          cache: true
+
+      - name: 依赖
+        working-directory: app
+        run: |
+          flutter pub get
+          ls -la ios
+
+      - name: 编译 iOS（不签名）
+        working-directory: app
+        run: |
+          set -o pipefail
+          VER_LINE=$(grep -m1 '^version:' pubspec.yaml | sed 's/version:[[:space:]]*//' | tr -d '\r')
+          APP_VERSION="${VER_LINE%%+*}"
+          APP_BUILD="${VER_LINE##*+}"
+          [ "$APP_BUILD" = "$VER_LINE" ] && APP_BUILD=0
+          echo "注入版本：$APP_VERSION ($APP_BUILD)"
+          flutter build ios --release --no-codesign \
+            --dart-define=API_BASE=https://dj.xltxa.cn \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=APP_BUILD="$APP_BUILD" \
+            2>&1 | tee /tmp/build.log
+          APP=$(find build -maxdepth 4 -name Runner.app -type d | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::编译返回 0 但没有产出 Runner.app"
+            tail -40 /tmp/build.log
+            exit 1
+          fi
+          echo "产物: $APP"
+
+      - name: 打包成 IPA
+        working-directory: app
+        run: |
+          set -euo pipefail
+          APP=$(find build -maxdepth 4 -name Runner.app -type d | head -1)
+          test -n "$APP"
+          rm -rf /tmp/Payload && mkdir -p /tmp/Payload
+          cp -R "$APP" /tmp/Payload/
+          cd /tmp && zip -qry "djshort-unsigned.ipa" Payload
+          ls -lh /tmp/djshort-unsigned.ipa
+
+      - name: 上传产物（优先 Release，artifact 兜底）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="ios-$(date +%Y%m%d-%H%M%S)"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          gh release create "$TAG" /tmp/djshort-unsigned.ipa \
+            --title "iOS unsigned $TAG" \
+            --notes "自动构建：未签名 IPA，Sideloadly 自签后安装"
+          echo "release=$TAG"
+
+      - name: 清理旧 Release（只留最新一条）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 每次构建都会新建 Release，久了会堆几十条。这里只保留最新一条，
+          # 旧的连 tag 一起删（--cleanup-tag）。
+          tags=$(gh release list --limit 50 --json tagName,createdAt --jq '.[1:][] | .tagName' || true)
+          for t in $tags; do
+            echo "删除旧 Release: $t"
+            gh release delete "$t" --yes --cleanup-tag || true
+          done
+          gh release list --limit 5
+
+      - name: artifact 兜底
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: djshort-ios-unsigned
+          path: /tmp/djshort-unsigned.ipa
+          retention-days: 1

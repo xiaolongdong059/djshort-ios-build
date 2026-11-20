@@ -1,0 +1,3444 @@
+import 'dart:async';
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
+// `#80`：锁与静音改自绘 —— 图标字体（Material / Cupertino）与河豚字形在
+// 钥匙孔有无、描边/实心、宽高比上都不一致，参数取自河豚像素剖面。
+import 'player_side_glyphs.dart';
+import 'package:flutter/services.dart';
+// 复刻河豚 #73：河豚竖滑音量调的是**系统**音量（依赖
+// `com.yosemiteyss.flutter_volume_controller`），不是 mpv 内部音量。
+import 'package:flutter_volume_controller/flutter_volume_controller.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:screen_brightness/screen_brightness.dart';
+
+import '../core/playback_session.dart';
+import '../core/settings.dart';
+import '../core/trace.dart';
+import '../models/danmu.dart';
+import '../models/vod.dart';
+import '../theme/app_theme.dart';
+import 'danmu_layer.dart';
+import 'long_press_speed_overlay.dart';
+import 'player_panels.dart';
+
+enum _DragMode { none, seek, brightness, volume }
+
+/// 全屏控制条能弹出的浮层（`ROADMAP.md` #52）。
+///
+/// 用**枚举 + 单一字段**而不是六个 bool：河豚同一时刻只允许一个面板，
+/// 六个 bool 必然出现「倍速和选集同时开着」这种状态。
+enum PlayerPanel {
+  none,
+  rate,
+  source,
+
+  /// 清晰度（`#52-h③`）：右组「720P」按钮弹出，按画质档位竖排。
+  /// 与 [source] 的区别：source 列**全部线路**（带 `共N集`），
+  /// quality 按档位聚合去重，只列画质，点选落到该档位集数最多的那条线路。
+  quality,
+  buffer,
+  skip,
+  episodes,
+  timer,
+  danmakuSetting,
+}
+
+/// 播放器**渲染器**：把一路 [PlaybackSession] 画出来 + 自定义控制条 + 手势。
+///
+/// ## 与 #65（会话复用）的关系
+///
+/// 这里**不再拥有** `Player` / `VideoController` —— 只负责画。
+/// 传了 [session] 就是「借用别人的引擎」（详情页小窗 → 全屏共用一路会话，
+/// 点全屏不重建解码器、不重新取流、位置零搬运，与河豚一致）；
+/// 不传就自己建一路（`PlayerPage` 从播放历史/继续观看独立进来时用），
+/// **不传时的行为与改造前完全一致**。
+///
+/// 所以一个会话可以先后被两个渲染器画：详情页小窗（`embedded: true`）和
+/// 全屏页（`embedded: false`）。同一时刻只挂一个 —— 详情页推全屏时会把小窗
+/// 卸下来（画面换成占位），全屏页用的是同一个 [PlaybackSession]。
+class VideoPlayerView extends StatefulWidget {
+  /// 借用的会话。给了就不再自建、也不负责销毁。
+  final PlaybackSession? session;
+
+  /// 播放地址。只在**自建会话**时使用；给了 [session] 就忽略
+  ///（地址由会话持有，换集/换线由页面调 `session.openUrl`）。
+  final String url;
+
+  /// 起播位置。同样只在自建会话时使用，且只消费一次。
+  final Duration? startAt;
+
+  final String title;
+  final String subtitle;
+  final VoidCallback? onBack;
+  final VoidCallback? onRetry;
+
+  /// 换线路入口（多线路时才有值），点击由外层弹线路选择
+  final VoidCallback? onSwitchSource;
+
+  /// 当前线路名，显示在换线按钮上
+  final String? sourceLabel;
+
+  // ---------- 底栏左组「互动数据」三簇（`#52-h②`）----------
+  //
+  // 全部可选、默认 0：三项都是 0 时整组不渲染（内嵌小窗根本不走这个控制条，
+  // 老后端 / 离线兜底也不会画出三个 `0`）。
+
+  /// 点赞数（`/api/j/detail` 的 `stats.like`）
+  final int likeCount;
+
+  /// 评论数（`stats.comment`，与详情页评论 Tab、评论面板标题同源）
+  final int commentCount;
+
+  /// 收藏数（`stats.fav`）
+  final int favCount;
+
+  /// 本片是否已收藏（决定 ★ 的配色）
+  final bool faved;
+
+  /// 点 ★。`null` = 收藏入口不可用（此时 ★ 只展示不可点）
+  final ValueChanged<bool>? onFavToggle;
+
+  /// 每 5 秒 & 退出时回调，用于持久化进度。
+  /// 只在**自建会话**时生效；传了 [session] 时进度回调由会话持有者设置。
+  final void Function(Duration pos, Duration dur)? onProgress;
+
+  /// 实时进度出口（弹幕层按秒对齐时间轴用）。只在自建会话时生效。
+  final ValueNotifier<Duration>? positionOut;
+
+  /// 时长出口。只在自建会话时生效。
+  final ValueNotifier<Duration>? durationOut;
+
+  /// 错误态出口。只在自建会话时生效。
+  final ValueNotifier<bool>? errorOut;
+
+  /// 内嵌模式（详情页顶部）：不铺满全屏、不自己建 Scaffold、控制条更紧凑。
+  ///
+  /// 内嵌时「全屏」按钮不再自己转屏（转屏后详情页的竖排布局会崩），
+  /// 而是回调 [onFullscreen] 由外层推全屏播放页（D1 后是同一个会话）。
+  final bool embedded;
+
+  /// 内嵌模式下点「全屏」的出口；为空时才退回默认的整页转屏
+  final VoidCallback? onFullscreen;
+
+  /// 起播前的封面兜底（详情页传影片海报）。
+  ///
+  /// media_kit 从 `open` 到出首帧要好几秒，这段屏幕只有缓冲圈，
+  /// 与河豚「进页就有画面」的观感差很远。所以「还没拿到时长」这一段铺海报，
+  /// 首帧一到立刻撤掉。
+  final String? poster;
+
+  /// 整页播放页进来就是横屏全屏态（与河豚一致：一进去就满屏）。
+  /// 此时返回键直接退出播放页，而不是先转回竖屏。
+  final bool startFullscreen;
+
+  // ---------- 河豚全屏九件（`ROADMAP.md` #52）----------
+  //
+  // 这一组全部**可选**：不传就退化成改造前那条「播放暂停 + 全屏」的简版控制条，
+  // 内嵌小窗（详情页顶部）就是这么用的 —— 它有自己的来源 chip 和弹幕开关。
+
+  /// 可切换的播放源（全屏「播放源」面板用）。空 = 不显示该按钮
+  final List<PlaySource> sources;
+
+  /// 当前播放源（面板里高亮用）
+  final PlaySource? currentSource;
+
+  /// 选了某条播放源
+  final ValueChanged<PlaySource>? onPickSource;
+
+  /// 选集数据（全屏「选集」面板用）。空 = 不显示该按钮
+  final List<EpisodeGroup> episodeGroups;
+
+  /// 当前线路在 [episodeGroups] 里的下标
+  final int groupIndex;
+
+  /// 当前集在所在 group 里的下标
+  final int epIndex;
+
+  /// 切换语言/线路 Tab
+  final ValueChanged<int>? onPickGroup;
+
+  /// 选集（下标是 group 内下标）
+  final ValueChanged<int>? onPickEpisode;
+
+  /// 「下一集」。为空 = 已是最后一集，按钮置灰
+  final VoidCallback? onNextEpisode;
+
+  /// 弹幕开关状态
+  final bool danmakuOn;
+
+  /// 弹幕开关点击
+  final ValueChanged<bool>? onDanmakuToggle;
+
+  /// 发送一条弹幕（输入框回车/点发送）。为空 = 隐藏输入框
+  final ValueChanged<String>? onSendDanmaku;
+
+  /// 弹幕时间轴（全屏也要飘弹幕，与河豚一致）
+  final List<Danmaku> danmaku;
+
+  /// 弹幕层 key：自己刚发的那条要 `inject` 立刻上屏。
+  ///
+  /// 不能让外层「往 [danmaku] 里插一条」来代替 —— `items` 一换，弹幕层会
+  /// 重置飞行队列（详见 `DanmakuLayerState`），屏幕上现有的几条会被一起清掉。
+  final GlobalKey<DanmakuLayerState>? danmuKey;
+
+  const VideoPlayerView({
+    super.key,
+    this.session,
+    this.url = '',
+    this.startAt,
+    this.title = '',
+    this.subtitle = '',
+    this.poster,
+    this.onBack,
+    this.onRetry,
+    this.onSwitchSource,
+    this.sourceLabel,
+    this.likeCount = 0,
+    this.commentCount = 0,
+    this.favCount = 0,
+    this.faved = false,
+    this.onFavToggle,
+    this.onProgress,
+    this.positionOut,
+    this.durationOut,
+    this.errorOut,
+    this.embedded = false,
+    this.onFullscreen,
+    this.startFullscreen = false,
+    this.sources = const [],
+    this.currentSource,
+    this.onPickSource,
+    this.episodeGroups = const [],
+    this.groupIndex = 0,
+    this.epIndex = 0,
+    this.onPickGroup,
+    this.onPickEpisode,
+    this.onNextEpisode,
+    this.danmakuOn = true,
+    this.onDanmakuToggle,
+    this.onSendDanmaku,
+    this.danmaku = const [],
+    this.danmuKey,
+  });
+
+  @override
+  State<VideoPlayerView> createState() => VideoPlayerViewState();
+}
+
+class VideoPlayerViewState extends State<VideoPlayerView> {
+  /// 自建的那路会话（借用模式下为 null → 销毁时不碰引擎）
+  PlaybackSession? _own;
+
+  /// 当前渲染的会话（借用或自建）
+  late PlaybackSession _s;
+
+  Timer? _hideTimer;
+
+  bool _controlsVisible = true;
+  late bool _isFullscreen = widget.startFullscreen;
+
+  /// 上一次看到的「是否在播」，用来在起播那一下补排控制条隐藏。
+  ///
+  /// `_scheduleHide()` 开头有 `if (!_s.playing) return;`，而首帧前调用必然空转
+  /// ⇒ 此前没有任何地方再补 ⇒ 控制条起播后**永远不消失**
+  ///（基准里播放中的详情页上方是没有控制条的）。
+  bool _lastPlaying = false;
+
+  double _startBrightness = 0.5;
+
+  // 手势
+  _DragMode _dragMode = _DragMode.none;
+  bool _dragging = false;
+  Duration _dragStartPos = Duration.zero;
+  double _panStartX = 0;
+  double _panStartY = 0;
+  double _startVolume = 100;
+
+  /// 系统音量缓存（0~100）。#73：竖滑音量改走系统音量后，
+  /// 起点取值不能等异步 `getVolume()` 回来再滑动，所以每次改完都记一份。
+  double _sysVolumeCache = 100;
+
+  Duration? _seekPreview;
+  double? _overlayValue;
+  String _overlayLabel = '';
+
+  /// surface 尺寸提示 / 首帧起播只做一次
+  bool _attached = false;
+
+  // ---------- #52 全屏九件的 UI 状态 ----------
+
+  /// 当前弹出的面板（`none` = 没弹）
+  PlayerPanel _panel = PlayerPanel.none;
+
+  /// 屏幕锁定：河豚左边缘那个锁。锁上后只留一个解锁按钮，手势全部禁用
+  ///（否则躺床上看片时会一直误触进度条）。
+  bool _locked = false;
+
+  bool _muted = false;
+  double _volBeforeMute = 100;
+
+  double _rate = 1.0;
+  int _bufferSecs = 60;
+
+  // ---------- 长按倍速（复刻河豚 `_handlePointerEvent@247513853` 一族）----------
+
+  /// 长按起效阈值。Flutter `kLongPressTimeout` 就是 500ms，河豚自己用
+  /// `Listener` + 计时器实现（不走 GestureDetector），阈值取同一口径。
+  static const Duration _kLongPressDelay = Duration(milliseconds: 500);
+
+  /// 按下后移动多少像素就判定「这不是长按，是滑动」。
+  /// 我方 `_onPanUpdate` 的拖动判定阈值是 10px，长按这边取 18px
+  /// 留余量 —— 长按时手会抖，阈值卡 10 会频繁误取消。
+  static const double _kLongPressSlop = 18.0;
+
+  /// 复刻河豚 `_longPressTimer`：按下起表，抬手/超位移取消。
+  Timer? _longPressTimer;
+
+  /// 按下点（判断位移用）
+  Offset? _longPressDown;
+
+  /// 长按倍速是否生效中（驱动 `LongPressSpeedOverlay`）
+  bool _longPressActive = false;
+
+  // 弹幕设置四项（`#52-h`）：面板拖动即时生效，所以放内存字段；
+  // 落盘由 `Settings.setDanmakuXxx` 负责，回显走 `initState`。
+  double _dmFontSize = 13;
+  double _dmArea = 1.0;
+  double _dmSpeed = 1.0;
+  double _dmOpacity = 1.0;
+
+  /// 定时关闭：`_sleepLeft == null` = 未开启
+  Duration? _sleepLeft;
+  Timer? _sleepTick;
+
+  // `#72` 第四次标定：`_liked` 随三簇互动角标一起撤掉了（河豚沉浸全屏底栏
+  // 没有这三簇，见 [_buildButtonRow] 里「弹幕输入胶囊」那段的证据链）。
+  // `likeCount` / `commentCount` / `favCount` 三个构造参数保留 —— 详情页
+  // 还在传，将来做「非沉浸横屏」那套 UI 时直接复用，不用再改链路。
+
+  /// 弹幕输入框
+  final TextEditingController _danmuCtrl = TextEditingController();
+  final FocusNode _danmuFocus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    // 起播链路打点 ①：本实例被创建 == 详情页刚把地址填上，
+    // 这一刻之前的耗时全在接口/页面层，之后的全在媒体层（`ROADMAP.md` #33）。
+    trace(
+      'player.init',
+      'embedded=${widget.embedded} shared=${widget.session != null}',
+    );
+    final shared = widget.session;
+    if (shared != null) {
+      _s = shared;
+    } else {
+      final own = PlaybackSession(
+        url: widget.url,
+        startAt: widget.startAt,
+        hardwareDecode: Settings.hardwareDecode, // #66
+        positionOut: widget.positionOut,
+        durationOut: widget.durationOut,
+        errorOut: widget.errorOut,
+      );
+      own.onProgress = widget.onProgress;
+      _own = own;
+      _s = own;
+    }
+    _lastPlaying = _s.playing;
+    // 倍速/缓冲的初值取用户上次的选择（设置里落过盘）
+    _rate = Settings.playbackRate;
+    _bufferSecs = Settings.bufferSecs;
+    _dmFontSize = Settings.danmakuFontSize;
+    _dmArea = Settings.danmakuArea;
+    _dmSpeed = Settings.danmakuSpeed;
+    _dmOpacity = Settings.danmakuOpacity;
+    _s.addListener(_onSession);
+    _s.positionOut.addListener(_onPosition);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_attached) return;
+    _attached = true;
+    // 预建 native surface 用的尺寸提示：真正的画面尺寸随后由
+    // `player.stream.videoParams` 纠正，所以这里给个近似值就够
+    //（读 media_kit_video 源码确认：SetSurfaceSize 不由 widget 布局驱动）。
+    final mq = MediaQuery.maybeOf(context);
+    final size = mq?.size;
+    if (size != null && size.width > 0 && size.height > 0) {
+      _s.surfaceHint = size;
+    }
+    final dpr = mq?.devicePixelRatio;
+    if (dpr != null && dpr > 0) _s.devicePixelRatio = dpr;
+    _s.start();
+    // #52：把用户上次选的三件「偏好」灌进会话。
+    // 会话层刻意不 import 设置模块（见 `PlaybackSession.rate` 注释），
+    // 由渲染器在挂载时同步一次 —— 内嵌小窗和全屏页都会走到，天然幂等。
+    _s.setRate(_rate);
+    unawaited(_s.applyBuffer(_bufferSecs));
+    _s.skipHead = Duration(seconds: Settings.skipHeadSecs);
+    _s.skipTail = Duration(seconds: Settings.skipTailSecs);
+    ScreenBrightness.instance.application
+        .then((v) => _startBrightness = v)
+        .catchError((_) => 0.5);
+    // #73：系统音量初值同步一份，右半屏竖滑的起点才不会永远是 100。
+    // 同时关掉系统音量条 —— 河豚是自绘 `音量 N%` overlay，不再叠一个系统 UI。
+    FlutterVolumeController.updateShowSystemUI(false).catchError((Object _) {});
+    FlutterVolumeController.getVolume().then((v) {
+      if (v == null) return;
+      _sysVolumeCache = v * 100;
+      _startVolume = _sysVolumeCache;
+    }).catchError((Object _) {});
+    // 河豚连拍实测 3s 自动隐藏；`#70` 按用户反馈放到 5s（见 `_scheduleHide`）。
+    // 全屏页是**新推一个页面**（`_toggleFullscreen` 在 embedded 模式下直接
+    // 交回详情页 `onFullscreen`），所以转屏补时要在 initState 这里再给一次 ——
+    // 否则全屏页的 5s 又会被转屏动画吃掉 0.5~0.7s。
+    _scheduleHide(
+      extra: widget.startFullscreen
+          ? const Duration(milliseconds: 1200)
+          : Duration.zero,
+    );
+  }
+
+  /// 换集 / 换线路：**复用同一个 native 实例**，只重新 open。
+  ///
+  /// 之前详情页是靠给这个 widget 换一个 `GlobalKey` 来「重建播放器」的，
+  /// 但 Flutter 的卸载是**帧末**做的：新实例已经开始 open 同一个声卡了，
+  /// 旧的 media_kit Player 才走到 dispose，中间那段时间两路音频同时出声
+  /// —— 就是用户听到的「切了影片还在响上一集的声音」。
+  @override
+  void didUpdateWidget(covariant VideoPlayerView old) {
+    super.didUpdateWidget(old);
+    // 借用模式：地址由会话持有、由页面调 `openUrl` 驱动。
+    // 这里绝不能再开一次，否则等于「页面开一次 + 渲染器再开一次」，
+    // 连点选集时就是两路 open 互相盖。
+    if (widget.session != null) return;
+    if (old.url == widget.url) return;
+    _s.openUrl(widget.url, startAt: widget.startAt);
+  }
+
+  void _onSession() {
+    if (!mounted) return;
+    final p = _s.playing;
+    // 起播成功这一下补排隐藏（见 `_lastPlaying` 注释）
+    if (p && !_lastPlaying) _scheduleHide();
+    _lastPlaying = p;
+    setState(() {});
+  }
+
+  /// 位置流每几十毫秒来一次：控制条藏着且没在拖就不重建，省性能
+  void _onPosition() {
+    if (!mounted) return;
+    if (!_controlsVisible && !_dragging) return;
+    setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _s.removeListener(_onSession);
+    _s.positionOut.removeListener(_onPosition);
+    _hideTimer?.cancel();
+    _sleepTick?.cancel();
+    // 长按倍速：表没撤就 dispose 会在 500ms 后打到已销毁的 State 上
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    _danmuCtrl.dispose();
+    _danmuFocus.dispose();
+    // 只销毁自己建的会话；借来的引擎归页面（详情页）管
+    _own?.dispose();
+    // 只有「整页播放器」才需要还原转屏和系统 UI。
+    // 内嵌那个从没改过方向，它被销毁时（详情页推全屏会把它放掉）如果跟着
+    // 设成竖屏 + edgeToEdge，会把全屏页刚设好的横屏/沉浸式覆盖掉。
+    if (!widget.embedded) {
+      SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+    super.dispose();
+  }
+
+  // ---------- 对外状态（页面读它） ----------
+
+  /// 当前播放位置（换线路时由外层读取，切过去后从同一处续播）
+  Duration get position => _s.livePosition;
+
+  /// 当前是否在播（详情页切全屏前要判断，暂停过的别硬 resume）
+  bool get isPlaying => _s.playing;
+
+  /// 详情页把页面盖住前先暂停，否则两路音频同时响
+  void pause() {
+    if (!mounted) return;
+    _s.pause();
+    _cancelHide();
+    setState(() => _controlsVisible = true);
+  }
+
+  /// 复用当前播放器重试（不重建 native 实例，避免 dispose/init 竞争导致崩溃）
+  void retryPlayback() {
+    _s.retry();
+  }
+
+  /// 从指定位置续播
+  Future<void> seekTo(Duration d) => _s.seekTo(d);
+
+  /// 兼容旧调用点：借用模式下**必须什么都不做**，
+  /// 否则会把详情页共享的引擎放掉（D1 之前这里是「推全屏前放掉内嵌实例」）。
+  void release() {
+    _own?.dispose();
+    _own = null;
+  }
+
+  // ---------- 控制条显隐 ----------
+  void _toggleControls() {
+    // 面板开着 / 锁屏时不响应「点画面切控制条」——
+    // 前者会让面板被压到控制条下面，后者本来就不该有任何反应。
+    if (_panel != PlayerPanel.none || _locked) return;
+    setState(() => _controlsVisible = !_controlsVisible);
+    if (_controlsVisible) _scheduleHide();
+  }
+
+  /// 控制条自动隐藏。
+  ///
+  /// 时长：河豚连拍实测 3s（`#52-f` 标定），但用户反馈「一点就没了，大概 1s」
+  /// （`#70`）—— 实测我方存活 2.8s 与代码一致，体感偏短的真正原因是
+  /// **全屏转屏瞬间就开始计时**（转屏动画吃掉 0.5~0.7s，用户还在看画面）。
+  /// 修法两条：① 基准 3s → 5s（`#70` 单点基线偏离，不外扩到其它视觉参数）；
+  /// ② 转场补时，见 [extra]。
+  ///
+  /// [extra] 转场补偿：`_toggleFullscreen()` 里 await 完方向切换后传 1.2s，
+  /// 让计时从「用户真正看到全屏界面」起算。
+  void _scheduleHide({Duration extra = Duration.zero}) {
+    _cancelHide();
+    if (!_s.playing) return;
+    // 正在发弹幕时不许自动收条：控制条一收，输入框跟着消失、焦点落在空处
+    //（键盘还挂着，看起来像「打字打一半界面没了」）
+    if (_danmuFocus.hasFocus) return;
+    _hideTimer = Timer(const Duration(seconds: 5) + extra, () {
+      if (!mounted || _dragging) return;
+      // 面板开着就别收控制条，否则关掉面板回来一片空白
+      if (_panel != PlayerPanel.none) return;
+      setState(() => _controlsVisible = false);
+    });
+  }
+
+  void _cancelHide() {
+    _hideTimer?.cancel();
+    _hideTimer = null;
+  }
+
+  void _togglePlay() {
+    if (_s.completed) {
+      _replay();
+      return;
+    }
+    _s.playOrPause();
+    _scheduleHide();
+  }
+
+  void _replay() {
+    _s.replay();
+    _scheduleHide();
+  }
+
+  Future<void> _toggleFullscreen() async {
+    // 内嵌模式：自己不转屏，交给详情页推全屏页（转屏会把竖排详情页布局搞乱）
+    if (widget.embedded) {
+      _cancelHide();
+      widget.onFullscreen?.call();
+      return;
+    }
+    final goFull = !_isFullscreen;
+    setState(() => _isFullscreen = goFull);
+    if (goFull) {
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    } else {
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.portraitUp,
+      ]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+    // `#70`：转屏动画 0.5~0.7s 期间用户看不到全屏界面，计时不该从这里起算，
+    // 否则「看到」的有效时间被吃掉一大截。补 1.2s 让 5s 完整落在可视期。
+    setState(() => _controlsVisible = true);
+    _scheduleHide(extra: const Duration(milliseconds: 1200));
+  }
+
+  // ---------- 手势 ----------
+  // ---------- 长按倍速（复刻河豚 `@247513853`）----------
+  //
+  // 为什么用 `Listener` 而不是 `GestureDetector.onLongPressStart/End`：
+  // 河豚符号表里是 `_handlePointerEvent` + `_cancelActiveGesture` 两个方法，
+  // 说明它没走 GestureDetector —— 手势层已经有 `onTap` / `onDoubleTap` /
+  // `onPan*`，再加 `onLongPress` 会进同一个 GestureArena：Pan 的 slop 只有
+  // 十几像素，长按时手指一抖 Pan 就赢，长按永远起不来。`Listener` 在竞技场
+  // 之外，按下—超时—抬手三段完全由自己控制，这与河豚的做法一致。
+
+  /// 复刻河豚 `_handlePointerEvent@247513853`。
+  void _handlePointerEvent(PointerEvent e) {
+    // 锁屏 / 面板开着时不进长按状态机（锁屏时整层手势都不挂，这里是兜底）
+    if (_locked || _panel != PlayerPanel.none) {
+      _cancelActiveGesture();
+      return;
+    }
+
+    if (e is PointerDownEvent) {
+      _longPressDown = e.position;
+      _longPressTimer?.cancel();
+      _longPressTimer = Timer(_kLongPressDelay, () {
+        if (!mounted) return;
+        if (_s.error != null) return;
+        _enterLongPressSpeed();
+      });
+      return;
+    }
+
+    if (e is PointerMoveEvent) {
+      // 长按已经生效后不再判定位移：长按期间用户手会小幅漂移，
+      // 这时取消会让「按着看快进」变成断断续续。
+      if (_longPressActive) return;
+      final down = _longPressDown;
+      if (down == null) return;
+      if ((down - e.position).distance > _kLongPressSlop) {
+        _cancelActiveGesture();
+      }
+      return;
+    }
+
+    // PointerUpEvent / PointerCancelEvent
+    _cancelActiveGesture();
+  }
+
+  /// 复刻河豚 `_cancelActiveGesture@247513853`：撤表 + 退出倍速。
+  void _cancelActiveGesture() {
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    _longPressDown = null;
+    _exitLongPressSpeed();
+  }
+
+  /// 按下满 500ms：切到长按倍速。
+  ///
+  /// 取值照河豚 `PlPlayerController.setDoubleSpeedStatus(true)`：
+  /// `enableAutoLongPressSpeed ? playbackSpeed * 2 : longPressSpeed`
+  ///（`Settings.effectiveLongPressSpeed` 就是这条表达式）。
+  void _enterLongPressSpeed() {
+    final target = Settings.effectiveLongPressSpeed;
+    if (target == _s.rate) return; // 已经在目标速率上，不重复打点
+    setState(() => _longPressActive = true);
+    _s.setRateTemporary(target);
+    _cancelHide();
+    // 对应河豚 `onLongPressStart` 里的 `feedBack()`
+    HapticFeedback.mediumImpact();
+    trace('player.rate.longpress', 'on $target');
+  }
+
+  /// 抬手 / 取消：还原到用户选的倍速。
+  ///
+  /// 用 [PlaybackSession.setRateTemporary] 期间 `_s.rate` 从没被动过，
+  /// 所以这里直接读回来即可（对应河豚
+  /// `setPlaybackSpeed(playbackSpeed)` 那一支）。
+  void _exitLongPressSpeed() {
+    if (!_longPressActive) return;
+    if (mounted) setState(() => _longPressActive = false);
+    _s.setRateTemporary(_s.rate);
+    trace('player.rate.longpress', 'off → ${_s.rate}');
+    if (_controlsVisible) _scheduleHide();
+  }
+
+  void _onPanStart(DragStartDetails d) {
+    // 滑动一开就撤长按：两者是互斥语义（河豚同样在 drag 分支里不再进倍速）
+    _cancelActiveGesture();
+    _panStartX = d.globalPosition.dx;
+    _panStartY = d.globalPosition.dy;
+    _dragStartPos = _s.position;
+    // #73 竖滑音量走系统音量：起点必须是**系统**当前音量，不是 mpv 的。
+    // `getVolume()` 是异步的，先用缓存值占位，回来后覆盖（滑动通常在
+    // 首次 Move 之后才真正出手，覆盖来得及）。
+    _startVolume = _sysVolumeCache;
+    FlutterVolumeController.getVolume().then((v) {
+      if (v == null) return;
+      _sysVolumeCache = v * 100;
+      _startVolume = _sysVolumeCache;
+    }).catchError((Object _) {});
+    _dragMode = _DragMode.none;
+    _cancelHide();
+  }
+
+  void _onPanUpdate(DragUpdateDetails d) {
+    final dx = d.globalPosition.dx - _panStartX;
+    final dy = d.globalPosition.dy - _panStartY;
+
+    if (_dragMode == _DragMode.none) {
+      if (dx.abs() > 10 && dx.abs() > dy.abs()) {
+        _dragMode = _DragMode.seek;
+        setState(() => _dragging = true);
+      } else if (dy.abs() > 10 && dy.abs() > dx.abs()) {
+        final w = MediaQuery.of(context).size.width;
+        _dragMode = _panStartX < w / 2
+            ? _DragMode.brightness
+            : _DragMode.volume;
+        setState(() => _dragging = true);
+      } else {
+        return;
+      }
+    }
+
+    final size = MediaQuery.of(context).size;
+    if (_dragMode == _DragMode.seek) {
+      final span = _s.duration > Duration.zero
+          ? _s.duration
+          : const Duration(hours: 2);
+      final target = _dragStartPos + span * (dx / size.width);
+      setState(() {
+        _seekPreview = target < Duration.zero
+            ? Duration.zero
+            : (target > span ? span : target);
+      });
+    } else {
+      final delta = -dy / size.height;
+      if (_dragMode == _DragMode.brightness) {
+        final v = (_startBrightness + delta).clamp(0.0, 1.0);
+        ScreenBrightness.instance.setApplicationScreenBrightness(v);
+        setState(() {
+          _overlayValue = v;
+          _overlayLabel = '亮度';
+        });
+      } else {
+        final v = (_startVolume + delta * 100).clamp(0.0, 100.0);
+        // #73：调**系统**音量（河豚同款口径）。播放器内部音量在
+        // `_applyPlayerOptions` 里锁满 100，避免系统音量 × mpv 音量双重衰减。
+        _sysVolumeCache = v;
+        _applySystemVolume(v);
+        trace('player.volume.sys', '${v.toStringAsFixed(0)}%');
+        setState(() {
+          _overlayValue = v / 100;
+          _overlayLabel = '音量';
+        });
+      }
+    }
+  }
+
+  void _onPanEnd(DragEndDetails d) {
+    if (_dragMode == _DragMode.seek && _seekPreview != null) {
+      _s.seek(_seekPreview!);
+    }
+    // #73 精度修正（Observed 缺陷）：系统音量是 0..15 的整数档，滑动过程中
+    // `_sysVolumeCache` 是浮点百分比（如 43%）。若一直拿它当「静音前音量」，
+    // `43% × 15 = 6.45 → 6`，实测表现就是「静音再取消少一格」。
+    // 抬手后回读一次真实档位覆盖缓存，让缓存始终等于系统当前值。
+    if (_dragMode == _DragMode.volume) {
+      FlutterVolumeController.getVolume().then((v) {
+        if (!mounted || v == null) return;
+        _sysVolumeCache = (v * 100).clamp(0.0, 100.0);
+      }).catchError((Object _) {});
+    }
+    setState(() {
+      _dragMode = _DragMode.none;
+      _dragging = false;
+      _seekPreview = null;
+      _overlayValue = null;
+      _overlayLabel = '';
+    });
+    _scheduleHide();
+  }
+
+  // ---------- #73 系统音量下发 ----------
+
+  /// 本机 `STREAM_MUSIC` 的档位上限（Observed：`dumpsys audio` 里
+  /// `STREAM_MUSIC: Min 0 / Max 15`）。只用于把百分比折成整数档。
+  static const int _kStreamMusicMax = 15;
+
+  /// 统一下发系统音量。
+  ///
+  /// 插件内部是 `setStreamVolume(stream, (max * volume).toInt(), ...)` ——
+  /// **截断**，不是四舍五入。所以「读回来再写回去」会掉一档：
+  /// 读 `7/15 = 0.46666…`，写回 `15 × 0.46666… = 6.999… → toInt() = 6`。
+  /// 实测表现就是「点静音再取消，音量从 7 变成 6」。
+  ///
+  /// 这里先折成整数档，再补半档偏置下发：
+  /// `step=7 → (7+0.5)/15 = 0.5 → 15 × 0.5 = 7.5 → toInt() = 7`。
+  /// 满档单独走 `1.0`（`15 × 1.0 = 15.0`），不越界。
+  void _applySystemVolume(double percent) {
+    final p = percent.clamp(0.0, 100.0);
+    final step = (p / 100 * _kStreamMusicMax).round().clamp(0, _kStreamMusicMax);
+    final pass =
+        step >= _kStreamMusicMax ? 1.0 : (step + 0.5) / _kStreamMusicMax;
+    FlutterVolumeController.setVolume(pass);
+  }
+
+  // ---------- 工具 ----------
+  static String _fmt(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+
+  // ---------- 海报兜底（`#39`） ----------
+
+  /// 打点只打一次，否则每帧都在首帧前重建、日志会被冲掉
+  bool _posterReqLogged = false;
+  bool _posterShownLogged = false;
+  bool _posterErrLogged = false;
+
+  /// 首帧前的封面层。
+  ///
+  /// 三条约束都是**实测**换来的：
+  /// 1. `fadeInDuration: Duration.zero` —— `CachedNetworkImage` 默认淡入 500ms，
+  ///    而这段空窗总共只有几秒，淡入等于把「黑→半透明海报」再演一遍；
+  /// 2. `imageBuilder` 里落一条 `poster.shown`，用来量「图片真正可见」的时刻
+  ///    —— 只有它能和 `player.firstframe` 相减算出真实空窗；
+  /// 3. `errorWidget` 落 `poster.err` 并附异常原文 —— 之前吞掉异常后画面
+  ///    只是纯黑，分不清「没加载完」还是「URL 挂了」，查起来全靠猜。
+  Widget _buildPoster() {
+    if (!_posterReqLogged) {
+      _posterReqLogged = true;
+      trace('poster.request');
+    }
+    return CachedNetworkImage(
+      imageUrl: widget.poster!,
+      fit: BoxFit.cover,
+      fadeInDuration: Duration.zero,
+      imageBuilder: (_, image) {
+        if (!_posterShownLogged) {
+          _posterShownLogged = true;
+          trace('poster.shown');
+        }
+        return Image(image: image, fit: BoxFit.cover);
+      },
+      // 海报挂掉时留纯黑，别把缓冲圈也顶掉
+      errorWidget: (_, url, e) {
+        if (!_posterErrLogged) {
+          _posterErrLogged = true;
+          trace('poster.err', e);
+        }
+        return const SizedBox.shrink();
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final showBar = _controlsVisible || _dragging || !_s.playing;
+    // 锁屏后除了「解锁」什么都不画 —— 否则躺床上看片会一直误触。
+    //
+    // 面板打开时**整条控制 UI 全部收起**（`ROADMAP.md` #52-f）：
+    // 河豚 k1/k2/k4/k5/k6/k7 六张真机截图里，任何面板打开期间顶栏、进度条、
+    // 九件行、左右侧栏一个都不在，画面上只剩面板本身。这样面板永远不会和
+    // 控制条互相遮挡（#52-a 的遮罩透字、#52-b 的压底部条一并消失）。
+    final chrome = showBar && !_locked && _panel == PlayerPanel.none;
+    final sideChrome = chrome;
+
+    // `#72` 第十二批收口：探针已采到真全屏窗口量
+    //   phys=Size(2241,1080) dpr=2.75 logical=814.9×392.7
+    //   mqPad=zero mqInset=zero
+    // ⇒ App 窗口只占屏幕 x99~2340（左 99px 挖孔区在窗口外），dp 换算基准是
+    // 2241 不是 2340；上一轮底栏「60px 漂移」是小窗路径下 mqPad.top=36 的
+    // 窗口态，不是代码偏差。探针完成使命，删除。
+    final stack = Stack(
+      fit: StackFit.expand,
+      // `#72` 第八次标定 —— 顶栏要整体上移 26px（见 [_buildTopBar] 的 `top: -9.45`），
+      // 溢出的部分必须放行。Stack 默认 `Clip.hardEdge` 会把屏幕顶以上的内容裁掉，
+      // 顶栏会变成「上半截被切平」，实测就是箭头只画出一半。
+      // 这里只放行子节点的绘制溢出，视频层本身是 `Center + BoxFit.contain`，
+      // 永远不会超界，所以对其它层没有副作用。
+      clipBehavior: Clip.none,
+      children: [
+        // 视频
+        Center(
+          child: Video(
+            controller: _s.controller,
+            controls: NoVideoControls,
+            fit: BoxFit.contain,
+            fill: Colors.black,
+          ),
+        ),
+
+        // 起播前海报兜底：压在 Video 上面、控制条下面。
+        //
+        // `#39` 判据演进（两轮）：
+        //   v1（已废）`duration > 0` —— duration 是 demuxer 属性，playlist
+        //     一解析完就有值，解码器可能一帧没吐 ⇒ 海报先撤、画面后到、露黑。
+        //   v2（现行）`firstFrame` = `player.stream.videoParams` 首报。
+        //   v3（`#39` 第二层）判据本身不变，但 `firstFrame` 的**语义扩了**：
+        //     纹理重建（`dw/dh` 掉 null → `vo=null` + `seek(0)`，实测 1900ms
+        //     纯黑）发生时 `PlaybackSession` 会把它复位成 false，重建出帧后再
+        //     置回 true ⇒ 海报自动盖住重建窗口。所以这里只读这一个布尔，
+        //     不在 UI 层堆第二套状态机（反补丁规则 1：一处判据、一处开关）。
+        // 缓冲/拖动时 firstFrame 早已为 true，不会误盖画面。
+        if (widget.poster != null &&
+            widget.poster!.isNotEmpty &&
+            !_s.firstFrame &&
+            _s.error == null)
+          Positioned.fill(child: _buildPoster()),
+
+        // 弹幕层（`ROADMAP.md` #52：全屏也要飘弹幕，与河豚一致）。
+        // 内部是 `IgnorePointer`，所以放在手势层上面也不会吃掉点击。
+        if (!widget.embedded && widget.danmaku.isNotEmpty)
+          Positioned.fill(
+            child: Padding(
+              padding: EdgeInsets.only(
+                top: MediaQuery.of(context).padding.top + 26,
+                bottom: MediaQuery.of(context).padding.bottom + 96,
+              ),
+              child: DanmakuLayer(
+                key: widget.danmuKey,
+                position: _s.positionOut,
+                items: widget.danmaku,
+                enabled: widget.danmakuOn,
+                // 四组全屏「弹幕设置」（`#52-h`）—— 改完立刻作用到正在飞的弹幕。
+                // 默认值与改造前写死的一致，不调就是原观感。
+                fontSize: _dmFontSize,
+                opacity: _dmOpacity,
+                area: _dmArea,
+                flyTime: Duration(
+                  milliseconds:
+                      (DanmakuLayer.defaultFlyTime.inMilliseconds / _dmSpeed)
+                          .round(),
+                ),
+              ),
+            ),
+          ),
+
+        // 手势层（锁屏时整层不挂，连双击都不响应）
+        //
+        // 外层 `Listener` 承载长按倍速（河豚 `_handlePointerEvent`）：
+        // 它在 GestureArena 之外，所以能「按住不动 500ms 进倍速」而不被
+        // 内层 GestureDetector 的 Pan 抢走；内层手势原样不动。
+        if (!_locked)
+          Positioned.fill(
+            child: Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: _handlePointerEvent,
+              onPointerMove: _handlePointerEvent,
+              onPointerUp: _handlePointerEvent,
+              onPointerCancel: _handlePointerEvent,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleControls,
+                onDoubleTap: _togglePlay,
+                onPanStart: _onPanStart,
+                onPanUpdate: _onPanUpdate,
+                onPanEnd: _onPanEnd,
+              ),
+            ),
+          ),
+
+        // 缓冲圈
+        if (_s.buffering && _s.error == null)
+          const Center(
+            child: SizedBox(
+              width: 42,
+              height: 42,
+              child: CircularProgressIndicator(
+                strokeWidth: 2.6,
+                color: Colors.white70,
+              ),
+            ),
+          ),
+
+        // 手势浮层
+        if (_dragging && (_seekPreview != null || _overlayValue != null))
+          Center(child: _buildDragOverlay()),
+
+        // 长按倍速浮层（复刻河豚 `_LongPressSpeedOverlay@247513853`）。
+        // 常挂而不是条件挂载：`AnimatedOpacity` 要淡入就必须先在树上；
+        // 内部 `_arrow` 只在 visible 时 repeat，不显示时零帧开销。
+        Positioned.fill(
+          child: LongPressSpeedOverlay(visible: _longPressActive),
+        ),
+
+        // 错误
+        if (_s.error != null) _buildError(),
+
+        // 播完
+        if (_s.completed && _s.error == null) _buildCompleted(),
+
+        // 顶部栏：内嵌时由详情页自己画常驻返回箭头，这里再画一个会重影
+        if (chrome && !widget.embedded) _buildTopBar(),
+        // `#71`：内嵌小窗顶栏（只有 标题 + [TV] + ⋯，见 `_buildEmbeddedTopBar`）
+        if (chrome && widget.embedded) _buildEmbeddedTopBar(),
+
+        // 左右侧竖排（锁定 / 静音）
+        if (sideChrome && !widget.embedded) _buildSideButtons(),
+
+        // 底部控制条
+        if (chrome) _buildBottomBar(),
+
+        // 锁屏态只剩解锁按钮
+        if (_locked && !widget.embedded) _buildLockedOverlay(),
+
+        // 浮层面板永远在最上层（它自带遮罩，点空白关掉）
+        if (_buildPanel() != null) _buildPanel()!,
+      ],
+    );
+
+    // 内嵌模式（详情页顶部）：外层已经有 Scaffold，这里只要一块黑底画布，
+    // 自己再套 Scaffold 会多出一层 Material 和返回手势拦截
+    if (widget.embedded) {
+      return ColoredBox(color: Colors.black, child: stack);
+    }
+
+    return PopScope(
+      // 进来就是全屏态时，返回键直接退出播放页（转屏交给 dispose 还原），
+      // 否则要按两次才退得出去，很烦
+      canPop: !_isFullscreen || widget.startFullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _isFullscreen) _toggleFullscreen();
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        // 键盘弹起时**不许挤压画面**（`ROADMAP.md` #52-c）。
+        // 默认 ADJUST_RESIZE 会把整棵 Stack 的高度压掉一个键盘的高度 →
+        // 全屏视频被压成中间一小块、右侧一片黑（真机 s36 实测）；
+        // 河豚是全屏输入，画面尺寸不变、只有输入条上浮。
+        resizeToAvoidBottomInset: false,
+        body: stack,
+      ),
+    );
+  }
+
+  Widget _buildDragOverlay() {
+    String text;
+    if (_seekPreview != null) {
+      text = '${_fmt(_seekPreview!)} / ${_fmt(_s.duration)}';
+    } else {
+      text = '$_overlayLabel ${((_overlayValue ?? 0) * 100).round()}%';
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 15,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildError() {
+    // 内嵌到详情页顶部时只有 16:9 高（约 220dp），完整版错误态塞不下会溢出
+    //（实测 "BOTTOM OVERFLOWED BY 8.1 PIXELS"），所以按高度切紧凑版。
+    return Container(
+      color: Colors.black.withValues(alpha: 0.86),
+      child: LayoutBuilder(
+        builder: (c, con) {
+          final compact = con.maxHeight < 300;
+          final pad = compact ? 8.0 : 24.0;
+          return Center(
+            child: SingleChildScrollView(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: pad),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.error_outline,
+                    color: Colors.white54,
+                    size: compact ? 30 : 46,
+                  ),
+                  SizedBox(height: compact ? 8 : 14),
+                  Text(
+                    '播放失败，可能是源站暂不可用',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: compact ? 13 : 15,
+                    ),
+                  ),
+                  SizedBox(height: compact ? 4 : 8),
+                  Text(
+                    // 只画**河豚口径**的用户文案（`ROADMAP.md` #81 改动②）。
+                    // 改前这里是 `_s.error!`，用户会在「播放失败」下面看到
+                    // 英文引擎串 `Could not open codec.`——河豚全量中文文案
+                    // 里 `硬解/软解/内核` 0 命中，引擎术语不外泄。
+                    _s.errorText ?? '播放失败',
+                    maxLines: compact ? 1 : 3,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white38,
+                      fontSize: compact ? 10 : 11,
+                    ),
+                  ),
+                  SizedBox(height: compact ? 10 : 20),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      FilledButton(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: AppTheme.accent,
+                          visualDensity: compact
+                              ? VisualDensity.compact
+                              : VisualDensity.standard,
+                          padding: compact
+                              ? const EdgeInsets.symmetric(horizontal: 14)
+                              : null,
+                        ),
+                        onPressed: () {
+                          _s.dismissError();
+                          if (widget.onRetry != null) {
+                            widget.onRetry!();
+                          } else {
+                            _s.retry();
+                          }
+                        },
+                        child: const Text('重试'),
+                      ),
+                      // 换线路：这条源挂了就换下一条，进度由外层保住（不回到片头）
+                      if (widget.onSwitchSource != null) ...[
+                        const SizedBox(width: 10),
+                        OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white,
+                            visualDensity: compact
+                                ? VisualDensity.compact
+                                : VisualDensity.standard,
+                            padding: compact
+                                ? const EdgeInsets.symmetric(horizontal: 10)
+                                : null,
+                          ),
+                          onPressed: () {
+                            _s.dismissError();
+                            widget.onSwitchSource!();
+                          },
+                          icon: Icon(Icons.swap_horiz, size: compact ? 15 : 18),
+                          label: const Text('切换线路'),
+                        ),
+                      ],
+                      const SizedBox(width: 10),
+                      OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white70,
+                          visualDensity: compact
+                              ? VisualDensity.compact
+                              : VisualDensity.standard,
+                          padding: compact
+                              ? const EdgeInsets.symmetric(horizontal: 10)
+                              : null,
+                        ),
+                        onPressed:
+                            widget.onBack ?? () => Navigator.pop(context),
+                        child: const Text('返回'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildCompleted() {
+    return Container(
+      color: Colors.black.withValues(alpha: 0.7),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              '已播完',
+              style: TextStyle(color: Colors.white70, fontSize: 15),
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(backgroundColor: AppTheme.accent),
+              onPressed: _replay,
+              icon: const Icon(Icons.replay, size: 18),
+              label: const Text('重播'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 顶部栏：河豚形态 = 返回 + `片名 集名 [当前源]` + 右侧四件
+  /// 🕐定时关闭 / `[TV]`投屏 / 画中画 / `⋯`更多。
+  ///
+  /// 河豚全屏**没有「退出全屏」按钮**（实测按返回键直接退出播放），
+  /// 所以这里也不放 —— 进了全屏页返回键就回详情页，与基准一致。
+  /// 顶栏集名归一（`#52-h④`）：采集站给 `第02集`，河豚顶栏是 `第4集`。
+  ///
+  /// 只剥「第」后面的前导零，其余形态（`EP01` / `第十集` / `04`）原样返回 ——
+  /// 这条只作用于顶栏展示，选集列表仍用原始 `title`，避免选集按钮宽度漂移。
+  static String _tidyEp(String s) {
+    final t = s.trim();
+    final m = RegExp(r'^第0+(\d+)(.*)$').firstMatch(t);
+    if (m != null) return '第${m.group(1)}${m.group(2)}';
+    return t;
+  }
+
+  Widget _buildTopBar() {
+    // 注意：**不要**在这里取 `MediaQuery.padding.top`。横屏沉浸建立过程中
+    // 这个值会在 0 与 ~9.7dp 之间漂移，用它算顶栏 padding 会让顶栏整条上
+    // 下跳 30px，1:1 永远对不齐（详见下方 padding 处第七次标定注释）。
+    // 标题格式与河豚 1:1（`#72` 复测修正）：
+    //   河豚 `夺金战 第4集 [高清·本站]`
+    //   → 片名 + **单空格** + 集名 + **单空格** + **半角**`[当前源]`
+    //
+    // `#52-h④` 曾把这里记成「全角【】」，`#72` 拿 `n6_full.png` 放大 2× 复核
+    // （`shots/_z_n6.png`）确认是**半角方括号**，且源名本身带 `·本站` 后缀
+    // （河豚的源名就是「高清·本站」，我方「蓝光·本站」同构）。全角括号的墨迹
+    // 宽度是半角的 1.6 倍，`h10_fullbar.png` 里 `[亿蓝光]` 整块 155px、
+    // 折算每括号仅 ~15px，全角对不上，故改回半角。
+    // 另两处（我方曾为双空格、采集站集名 `第02集` 补零）保持不变，已改好。
+    final buf = StringBuffer(widget.title);
+    if (widget.subtitle.isNotEmpty) buf.write(' ${_tidyEp(widget.subtitle)}');
+    final src = widget.currentSource?.label ?? widget.sourceLabel;
+    if (src != null && src.isNotEmpty) buf.write(' [$src]');
+
+    return Positioned(
+      left: 0,
+      right: 0,
+      // `#72` 第八次标定 —— **顶栏整条上移 26px（-9.45dp）**。
+      //
+      // 第七次把 `padding.top` 从 `MediaQuery.padding.top + 2` 改成死值 2.8dp，
+      // 本意是消掉「沉浸建立期 inset 漂移 30px」，但改完复测整条**仍偏低 26px**
+      // （`_c77b_my_top.png`，窗口 0~150，阈值 205）：八件墨迹顶 49~50，河豚 23~24。
+      // 逐件相对间距已经和河豚一致（schedule 比箭头高 10~11px，两边相同），
+      // 说明这不是「间距问题」也不是「某个件太大把 Row 撑起来」，是**整条平移**。
+      // 而 padding 只剩 2.8dp = 7.7px，再怎么调也只能动 7.7px —— 缺口不在 padding，
+      // 在于 `_topAction` 那颗 `size: 30` 的表盘把 Row 撑到 ~46dp，
+      // 其余各件在这个高盒里**居中**，于是整条被压低了 ~18px。
+      // 结论：纵向不从内部挪，直接把整个 Positioned 顶边抬到屏幕外。
+      //   目标上移 26px ⇒ 26 / 2.75 = 9.45dp
+      // 配合 `clipBehavior: Clip.none`（见 build() 里 Stack 处），溢出部分正常绘制。
+      // 待复测：八件墨迹顶应落到 23~24、中心 46.5。
+      //
+      // `#79` 第九次标定 —— **上面那次标定的基准源错了，-9.45 整体过头 30px**。
+      //
+      // 第八次当时拿「八件墨迹顶 23~24」当河豚目标值，但那张河豚图的 inset 已经
+      // 被系统清掉；而 `shots/ht10/ht_full_ctrl.png`（同为 2340×1080）里箭头墨迹是
+      // **54~99 / 中心 76** —— 才是 inset 未清除那一版的真实形态。
+      // 按错误的 23~24 去上移，结果越过目标 30px。
+      //
+      // 本轮排除了「路径差」这个最大嫌疑，证据链完整：
+      //   ① 路径 ①（`history_page.dart:109` 的 `_Row` 直推 PlayerPage，不经小窗）
+      //      实测 ink rows y=14..81 center=47，箭头 x179..225 y24..69 yc46，
+      //      [TV] x1780..1842 y20..72 yc46；
+      //   ② 路径 ②（详情页小窗 → `_toFullscreen`）实测 y=14..81 center=47，逐位相同；
+      //   ③ 连抓三轮（`stab_1/2/3.png`）全部 y=14..81 center=47 —— **不是竞态**，
+      //      稳定偏移，可以直接按差值改常量。
+      //   ④ 同图底栏右组五件 yc 990~991 vs 河豚 990（Δ≤1px）、x 全线 Δ≤2px ——
+      //      底栏走 `bottom: 12.32`，标定正确，不受本次影响。
+      //
+      // 逐件 y 差（我方 → 河豚，全部 +30px，同一个量）：
+      //   返回 46→76 / 定时 47→76 / TV 46→76 / PIP 47→78 / ⋯ 47→76 /
+      //   电池 47→76 / 100% 46→76
+      // 30 / 2.75 = 10.9dp ⇒ -9.45 + 10.9 = 1.45
+      // 注：30px 与横屏状态栏 inset(9.7dp≈27px) 同量级，第八次把它当成「inset 漂移」
+      // 是可以理解的误判 —— 但三轮稳定复测证明 inset 现在根本没参与布局，纯常量问题。
+      top: 1.45,
+      child: Stack(
+        children: [
+          Container(
+        // `#72` 左侧位移：河豚返回箭头墨迹起点 x=181，我方原 x=139（左移 42px
+        // = 15.3dp，容器原来只给 left:2）。这不是图标大小问题（箭头墨迹
+        // 45×46px 与河豚 47×47px 基本一致），纯粹是左边距薄 —— 实测差异全部
+        // 来自这 15dp，一并补上，同时也把「顶栏左侧留出屏幕挖孔位」这个
+        // 河豚的隐含 inset 复现出来。
+        // `#72` 第五次标定（右内边距 6 → 11.8dp，+16px）：
+        // 我方 `x76_fs.png` 顶栏最右墨迹（`100%`）落在 x2321，河豚 `ht_live_fs3.png`
+        // 是 x2305 —— 整体右溢 16px。这 16px 一次性解释了**右组五件全偏**：
+        //   改前 1653→1671 / 1781→1798 / 1899→1918 / 2028→2046（各偏 17~19px）
+        // 补 5.8dp 后五件一起左移，逐件落回 ±2px。
+        // `#72` 第七次标定（`top: 2 → 4dp`，整条下移 5.5px）：
+        // 六次改完后顶栏横向已落到 ±3px，但**纵向全线偏上**。逐簇实测
+        // （`_c72b_ht_top.png` vs `_c72b_my_top.png`，阈值 205）墨迹中心 y：
+        //   返回 46.5 / 标题 45.5 / 时钟 46.5 / TV 46.5 / PIP 48 / ⋯ 46.5 /
+        //   电池 46.5 / 100% 46        （河豚）
+        //   返回 41.5 / 标题 39   / 时钟 41.5 / TV 41   / PIP 41 / ⋯ 41  /
+        //   电池 41   / 100% 40        （我方）
+        // 八件齐差 5~6px，是**同一个容器内边距**造成的整条偏移，不是各件问题。
+        //
+        // `#72` 第七次追加 —— **`MediaQuery.padding.top` 必须从公式里去掉**。
+        // 照 2→4dp 改完重测，整条反而**偏下 30px**（箭头墨迹 21~62 → 54~99）：
+        // 关键盘不在 2dp，而在这个变量。全屏沉浸刚建立时状态栏 inset 还在
+        // （横屏 ~9.7dp），几秒后系统才真正把它清掉 —— 于是同一份代码，
+        // 截图早一点晚一点差 30px，1:1 永远对不齐，也会让下一轮标定拿到
+        // 漂移的基准。河豚顶栏在横屏沉浸下是**死贴屏幕顶**的定值，所以这里
+        // 也写定值：4dp（改前实测所需）- 1.2dp（上轮偏下 30px 折算的过冲）
+        // = 2.8dp。
+        // `#72` 第十二批收口：左内边距 17.3 → 16.6dp（-1.9px）。
+        // 真全屏实测返回箭头墨迹 183~227，河豚 181~225 —— 整条右移 2px。
+        // 左侧只有这一件，`Expanded` 会吸收差额，右侧六件由 `right: 11.8`
+        // 定位，一位不动；标题起点同时从 277 落到 275（河豚 273），同向受益。
+        padding: const EdgeInsets.only(top: 2.8, left: 16.6, right: 11.8, bottom: 6),
+        decoration: BoxDecoration(
+          // `#72`：顶栏衬底同底栏一起加实。原 `0.72→0.18→transparent` 三段均分，
+          // 图标行中心落在 alpha≈0.45，视频亮部穿过衬底后剩 ~140 灰 —— 与
+          // `#72` 底栏是同一个根因（衬底衰减太快），一并修。
+          // 对拍依据：河豚 `n6_full.png` 顶栏 p50=8.4 / p99=91.9，
+          // 我方改前 `r5.png` p50=38.2 / p99=128.0。
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Colors.black.withValues(alpha: 0.90),
+              Colors.black.withValues(alpha: 0.82),
+              Colors.black.withValues(alpha: 0.45),
+              Colors.transparent,
+            ],
+            stops: const [0.00, 0.55, 0.85, 1.00],
+          ),
+        ),
+        child: Row(
+          children: [
+            // `#72`：河豚返回键是**粗直箭头 `←`**，不是我方原来的细折角 `‹`。
+            // 真机像素实测（`h10_fullbar.png`，2340×1080，三通道白 >205 判据）：
+            //   河豚 墨迹 47×47px（x180~226 / y54~100），正方形 —— 横杠长 = 箭头高，
+            //   笔宽约 7px，是 Material `arrow_back` 的字形，不是一个 chevron。
+            //   我方 改前 墨迹 24×42px（`arrow_back_ios_new` size 19），又窄又细。
+            // `arrow_back` 墨迹 ≈ 0.75em ⇒ size 24dp 出 49.5×49px，对上河豚 47×47。
+            // `#72` 第七次标定（size 24 → 26dp）：同判据实测我方墨迹只有
+            // 42×42px，河豚 45×46px —— 宽矮 3px、高矮 4px，箭头小一号。
+            // 实测比例 42/66px(24dp) = 0.636 ⇒ 要 45.5px 需 em = 71.5px = 26dp。
+            IconButton(
+              icon: const Icon(
+                Icons.arrow_back,
+                color: Colors.white,
+                size: 26,
+              ),
+              onPressed: widget.onBack ?? () => Navigator.pop(context),
+              visualDensity: VisualDensity.compact,
+            ),
+            Expanded(
+              // `#72`：河豚「返回箭头墨迹右缘 225 → 标题墨迹起点 275」留 49px，
+              // 我方同段只有 38px —— 补 4dp(11px)，把标题起点从 260 顶到 275。
+              child: Padding(
+                padding: const EdgeInsets.only(left: 4),
+                child: Text(
+                buf.toString(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  // `#72`：河豚标题字面比我方大一圈。同判据实测汉字墨迹高：
+                  //   河豚 45px（`尚` y54~98） → em ≈ 52px ≈ 19dp
+                  //   我方 34px（`贞` y53~86） → em = 38.5px = 14dp
+                  // 45/34 × 14 ≈ 18.5，取 18dp（墨迹 ~44px）。
+                  // 字重：河豚笔画比 w600 细一档，改 w500；`Expanded` 左对齐，
+                  // 字号不影响起点 x=217 这条既有基线。
+                  fontSize: 18,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              ),
+            ),
+            // 🕐 定时关闭：开着时直接显示剩余时间（河豚同款）
+            //
+            // `#72` 字形对拍（`h10_fullbar.png` 5× 放大）：河豚是**纯圆表盘 + 两根
+            // 指针**（无旋钮），即 `Icons.schedule`；我方原用 `timer_outlined`
+            // 是秒表（顶部横杠旋钮 + 右侧斜颈 + 中间一根竖针），形状完全不同。
+            // `#72` 二次标定：河豚图标墨迹 67×67px（时钟，`h10_fullbar.png` 实测），
+            // 我方 size 25 只出 56×57px —— 反而比自己自绘的 TV（62px）/画中画（60px）
+            // 还小，视觉上「时钟缩了一号」，与河豚相反。Material 圆形字形墨迹
+            // ≈ 0.68em ⇒ 67/0.68 ≈ 98px ≈ 30dp。原注释担心的「31dp 会把标题压到
+            // 只剩两个字」在当前标题长度下不成立（标题右缘 661，时钟左缘 1868，
+            // 中间空 1200px），故改 30dp。
+            _topAction(
+              icon: Icons.schedule,
+              size: 30,
+              label: _sleepLeft == null
+                  ? null
+                  : SleepTimerPanel.labelOf(_sleepLeft),
+              active: _sleepLeft != null,
+              onTap: () => _openPanel(PlayerPanel.timer),
+            ),
+            // [TV] 投屏
+            // `#72`：河豚画的是**圆角矩形里一个 `TV` + 底部一条独立横杠**。
+            // Material 没有这个字形（`Icons.tv` 框内是空的、`Icons.live_tv`
+            // 是天线 + 播放三角），所以自绘：框 23×14.5dp + `TV` 8.5dp 粗体
+            // + 20×2.4dp 横杠，全部尺寸来自 `h10_fullbar.png` 墨迹 63×52px ÷2.75。
+            _topActionRaw(
+              glyph: const _TvGlyph(size: 25),
+              onTap: () => _toast('投屏需要同一局域网内的 DLNA 设备，当前未发现'),
+            ),
+            // 画中画
+            // `#72`：河豚是**断开的大框（只留右上 L 与左下 L）+ 左上 ↘ 箭头 +
+            // 右下小空心框**，Material 的 `picture_in_picture_alt(_outlined)`
+            // 都是完整大框 + 右下小框，缺箭头、且大框不断开，故自绘。
+            _topActionRaw(
+              glyph: const _PipGlyph(size: 25),
+              onTap: () => _toast('画中画功能待接入'),
+            ),
+            // ⋯ 更多：把「不在底部九件里」的播放设置收在这里
+            //
+            // `#72`：河豚三个点的**点径 12px、间隔 9.5px，整组墨迹 55×12px**
+            // （x2028~2082 实测）；`Icons.more_horiz` size 22 只出 39×10px
+            // ——点到点太挤。Material 该字形改不了点距，改自绘：
+            // 点径 4.4dp(12px)、间隔 3.45dp(9.5px) ⇒ 3×4.4 + 2×3.45 = 20dp = 55px。
+            // `#71`：菜单本体抽到 `_buildMoreMenu`，小窗顶栏复用同一份。
+            _buildMoreMenu(const _ThreeDots()),
+            // 🔋 电量 + 百分比（`#72` 第四次标定 · 我方此前完全缺这一件）
+            //
+            // 证据链（`#72` 关键推翻）：上一轮把河豚顶栏右端 `x2141~2305`
+            // 判成「系统状态栏电量，不属于对拍范围」——**错的**。
+            // `ht_live_fs.png`（河豚真机、控制条**隐藏**态）同带扫描只剩 6 簇，
+            // `2141~2305` 整段消失；`ht_live_fs3.png`（控制条 ON）它又回来。
+            // 系统状态栏不会跟着控制条显隐 ⇒ 这是河豚**自绘在顶栏里**的控件。
+            // 顶栏正中那颗 `15:20` 同理（`1174~1266`），一起消失、一起回来。
+            //
+            // 尺寸（`ht_live_fs3.png` 阈值 150 逐段扫，`_z_ht_batt.png` 6× 复核）：
+            //   电池框   2140~2189 × y60~93  = 50×34px = 18.2×12.4dp，圆角 ≈2.4dp
+            //   电极凸起 2192~2198 × y69~84  =  5×16px =  1.8×5.8dp（细短竖条，
+            //             不是方块；与框间隔 3px=1.1dp，垂直居中于框）
+            //   框内填充 满格 —— 白块左右各留 2~4px，右侧留得多一点
+            //   `100%`   2213~2305 × y62~90  = 93×29px，fontSize ≈ 14dp
+            //   电池→文字 墨迹间隔 16px = 5.8dp
+            //   整块右缘 2305 距屏右 2340 有 35px = 12.7dp
+            //
+            // `#72` 第五次标定：电池件宽度**一次到位**（我方三段墨迹
+            // `2150~2207 / 2227~2237 / 2249~2321` vs 河豚 `2140~2197 / 2213~2223 /
+            // 2234~2305`，宽 58/11/73 对 58/11/72 —— 只差 1px），剩下两处纯位移：
+            //   ① 整块右缘 2321 → 2305：由外层 `right: 6 → 11.8` 统一解决；
+            //   ② 电池→文字间隔 20px → 16px：`SizedBox` 5.5 → 4.1dp（-3.85px）。
+            // `#72` 第十次标定 —— 这一颗的**左内边距就是 ⋯ → 电池 的间距**，
+            // 而右端（电池 / 100%）由外层 `right: 11.8` 钉死，所以整条左半边
+            // （时钟 / TV / PIP / ⋯）的位置全由这个数决定。逐簇实测间距：
+            //   河豚 时钟件→TV 61 / TV→PIP 55 / PIP→⋯ 70 / ⋯→电池 59
+            //   我方 时钟件→TV 61 / TV→PIP 58 / PIP→⋯ 69 / ⋯→电池 51
+            // 前三段都在 ±3px，唯独 ⋯→电池 少 8px，于是 ⋯/PIP/TV/时钟 被整体
+            // 顶右 5~7px（时钟 1658 vs 1653、TV 1786 vs 1781、PIP 1906 vs 1899、
+            // ⋯ 2034 vs 2028）。补 6px = 2.2dp 后这四件回落 (2028/1899/1780/1652)。
+            Padding(
+              padding: const EdgeInsets.only(left: 6.2),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: const [
+                  _BatteryGlyph(),
+                  SizedBox(width: 4.1),
+                  Text(
+                    '100%',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      height: 1.0,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+          ),
+          // —— 第二层：当前时间 `HH:mm`（河豚顶栏正中那颗小字，见 [_TopClock]）——
+          //
+          // `#72` 第四次标定：河豚墨迹 `1174~1266`（w=93，中心 1220）；
+          // 我方 `Alignment(0.043)` 实测落在 `1223~1312`（w=90，中心 1267.5），
+          // 整块右偏 47.5px。回到 `Align` 的定位公式：
+          //   center = (a+1)/2 × (2340 - 90) + 45
+          // 要 `center = 1220` ⇒ a ≈ 0.044…… 但实测 a=0.043 却给 1267.5，
+          // 说明这层不是被这个 `Align` 单独定位的（`Positioned.fill` 内的
+          // `Align` 拿到的是 Stack 尺寸，而文本自身宽不止 90px）。
+          // 所以按**实测差值**修：右偏 47.5px，屏宽 2340 ⇒ Δa = -47.5×2/2250
+          // = -0.0422，`0.043 - 0.0422 ≈ 0.001`。改完必须复测中心是否落在 1220。
+          // `#72` 第七次标定（y: 0.30 → 0.12，随后**整体改为 `Positioned(top:)`**）：
+          // 时间字是整条顶栏唯一偏下元素（河豚墨迹中心 57，我方 62.5）。
+          // 第一版按 `center = (y+1)/2 × H` 反解成 y=0.12，重测反而落到 85.5 ——
+          // 因为 `H`（顶栏 Stack 高度）本身被上一处 padding 改动带动，比例式
+          // 定位把「容器高度的变化」又乘了一遍，改 A 顺带改了 B，永远收敛不了。
+          // 结论：**纵向不用比例，用绝对像素**。`Positioned(top: T)` 让墨迹中心
+          // 只跟 T 线性相关（中心 = T + 常量），一次实测就能解出常量：
+          //   _TopClock 是 fontSize 13.5 / height 1.0 的单行 Text ⇒ 盒高 37px，
+          //   盒中心 = T + 18.5，目标墨迹中心 57 ⇒ T = 38.5。
+          // `#72` 第八次标定 —— `top: 38.5 → 24.5dp`。
+          // 第七次把单位算错了：注释里推的是**像素**（盒高 37px、中心 = T + 18.5），
+          // 但 Dart 里所有数值都是**逻辑像素**，38.5 直接当 dp 用 = 105.9px。
+          // 实测印证：`_c77b_my_top.png` 时钟墨迹 `108~135`，盒顶 105.9 + 2.1 ≈ 108 ✓
+          // —— 正好落在 38.5dp 上，说明公式本身对，只是单位差 2.75 倍。
+          // 本次连带顶栏整条上移 26px，时钟跟着上移，重新解一遍：
+          //   当前墨迹中心 121.5 → 上移 26 → 95.5，目标 57（河豚 43~71 的中心）
+          //   ⇒ 还要再上移 38.5px ⇒ T = 38.5dp - 38.5/2.75 = 24.5dp
+          Positioned(
+            top: 24.5,
+            left: 0,
+            right: 0,
+            child: IgnorePointer(
+              child: Align(
+                alignment: const Alignment(0.001, 0.0),
+                child: const _TopClock(),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// `#71`：非全屏（详情页内嵌小窗）顶栏 —— 1:1 河豚 `ht_ctrl2.png`。
+  ///
+  /// 河豚小窗顶栏只有**四件**：`←` / `片名 集名` / `[TV]` / `⋯`。
+  /// 全屏那套里的 🕐定时 / 画中画 / 电池 + `100%` / 居中时钟在小窗里
+  /// **一件都没有** —— `ht_ctrl2.png`（1080×2340）逐件点数确认。
+  /// 返回箭头仍由详情页常驻画（`detail_page._buildPlayerHeader`），本层不重复画，
+  /// 所以这里只补「标题 + 右上两件」。
+  ///
+  /// 尺寸来源：**第二次标定**（第一次是目视量 500px 渲染图，全错，作废）。
+  /// 现值为 `ht_ctrl2.png`（1080×2340 竖屏原图）**像素级实测**，
+  /// 用「白色墨迹 + 7px 内邻域有暗像素」逐簇扫描得到，实机 px ÷ 2.75 = dp：
+  ///
+  ///   件        墨迹 x（px）     墨迹 y（px）      换算 dp
+  ///   `←`       64..106          155..197（yc176） 23.3..38.5 / yc 64.0
+  ///   标题      152 起           158..192（yc175） 55.3 起 / yc 63.6
+  ///   `[TV]`    847..910 ×139..190（w64 h52）      308.0..330.9 / yc 59.8
+  ///   `⋯`       967..1021        159..170（w55）   351.6..371.3 / yc 59.8
+  ///
+  /// ⇒ 三条硬结论（第一次标定全搞反了）：
+  ///   ① `[TV]` 墨迹 64×52px = **23×19dp，与全屏 `_TvGlyph(size: 25)` 逐位相同**
+  ///      —— 小窗并不缩小图标；上一版按 0.62 缩到 15.5 是错的。
+  ///   ② `⋯` 点径 12px / 点距 10px / 整组 55px = **4.4 / 3.45 / 20dp，与全屏一致**
+  ///      —— 上一版的 2.4 / 1.9 是错的。
+  ///   ③ 标题与箭头比图标低 ≈11px（4dp）：河豚小窗里标题基线与 `[TV]` 中心**不同轴**，
+  ///      标题/箭头 yc 175~176，图标 yc 164.5。
+  ///
+  /// 反推热区：`⋯` 墨迹右缘距屏右 21.5dp ⇒ 外层 `right: 13.5` + 8dp 内边距；
+  /// `[TV]` 墨迹右缘 → `⋯` 墨迹左缘 20.4dp ⇒ TV 热区 `pad: 11` + 8dp 内边距 + 1dp 字形留白。
+  ///
+  /// 只画标题与右上组、不画返回箭头，是为了不破坏「小窗箭头常驻」这个既有行为：
+  /// 箭头由详情页画、跟着页面走；本层跟 `chrome` 显隐，与底栏同拍。
+  Widget _buildEmbeddedTopBar() {
+    final buf = StringBuffer(widget.title);
+    if (widget.subtitle.isNotEmpty) buf.write(' ${_tidyEp(widget.subtitle)}');
+
+    return Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: Padding(
+        // 13.5 + 8 = 21.5dp = 河豚 `⋯` 墨迹右缘距屏右的实测值
+        padding: const EdgeInsets.only(right: 13.5),
+        child: SizedBox(
+          height: 48,
+          child: Row(
+            children: [
+              // 54.5 + 0.8(字形左侧留白) = 55.3dp = 河豚标题墨迹起点实测值
+              const SizedBox(width: 54.5),
+              Expanded(
+                // `top: 8` 让居中后的文字再下沉 4dp：河豚小窗标题 yc 比图标 yc 低 4dp
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(
+                    buf.toString(),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      height: 1.0,
+                    ),
+                  ),
+                ),
+              ),
+              _topActionRaw(
+                glyph: const _TvGlyph(size: 25),
+                pad: 11,
+                onTap: () => _toast('投屏需要同一局域网内的 DLNA 设备，当前未发现'),
+              ),
+              // 8dp 内边距撑出热区；竖向 13 是为了不把 48dp 行撑高（对称，不改墨迹中心）
+              Padding(
+                padding: const EdgeInsets.only(
+                  left: 8,
+                  right: 8,
+                  top: 13,
+                  bottom: 13,
+                ),
+                child: _buildMoreMenu(const _ThreeDots(), tight: true),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// `⋯` 更多菜单 —— 全屏顶栏与小窗顶栏**共用同一份菜单项**（规则 1 反补丁：
+  /// 两处如果各写一份 `PopupMenuButton`，下一次加菜单项必然漏掉一处）。
+  /// 只有图标尺度、热区随调用点不同，逻辑与文案只有这一份。
+  ///
+  /// `tight`：`PopupMenuButton` 走 `icon:` 时会套一层 `IconButton`，移动端
+  /// `materialTapTargetSize` 缺省为 `padded`，外层被撑到 `kMinInteractiveDimension`
+  /// （48×48dp）并把图标居中 —— 全屏那套 `#72` 已按 48dp 盒子标定过，动不得。
+  /// 小窗需要「墨迹右缘距屏右 21.5dp」这种紧凑贴边，所以改走 `child:` 分支
+  /// （该分支自带 `MaterialTapTargetSize.shrinkWrap`，尺寸 = 子件尺寸，热区由
+  /// 调用点的 `Padding` 自己撑）。
+  Widget _buildMoreMenu(Widget icon, {bool tight = false}) => PopupMenuButton<String>(
+        tooltip: '',
+        padding: EdgeInsets.zero,
+        // 两条分支共用同一份 onSelected / itemBuilder，只有包裹方式不同
+        icon: tight ? null : icon,
+        color: kPanelBg,
+        onSelected: (v) {
+          switch (v) {
+            case 'buffer':
+              _openPanel(PlayerPanel.buffer);
+            case 'skip':
+              _openPanel(PlayerPanel.skip);
+            case 'timer':
+              _openPanel(PlayerPanel.timer);
+          }
+        },
+        itemBuilder: (_) => const [
+          PopupMenuItem(
+            value: 'buffer',
+            child: Text(
+              '缓冲设置',
+              style: TextStyle(color: Colors.white, fontSize: 13),
+            ),
+          ),
+          PopupMenuItem(
+            value: 'skip',
+            child: Text(
+              '片头片尾',
+              style: TextStyle(color: Colors.white, fontSize: 13),
+            ),
+          ),
+          PopupMenuItem(
+            value: 'timer',
+            child: Text(
+              '定时关闭',
+              style: TextStyle(color: Colors.white, fontSize: 13),
+            ),
+          ),
+        ],
+        // 必须放在最后（`sort_child_properties_last`）；`icon` 与 `child` 二选一
+        child: tight ? icon : null,
+      );
+
+  /// 顶部栏右侧的小按钮（图标 + 可选文字，河豚是纯图标 + 灰白描边）
+  Widget _topAction({
+    required IconData icon,
+    required VoidCallback onTap,
+    String? label,
+    bool active = false,
+    double size = 25,
+  }) =>
+      _topActionRaw(
+        glyph: Icon(icon,
+            color: active ? AppTheme.accent : Colors.white, size: size),
+        onTap: onTap,
+        label: label,
+        active: active,
+      );
+
+  /// `#72`：河豚顶栏右组的「电视」「画中画」两颗不是 Material 内置字形 ——
+  /// 电视是**圆角框内带 `TV` 两个字母** + 下方独立横杠；画中画是**断开的
+  /// 大框（只留右上 L 与左下 L）+ 左上 ↘ 箭头 + 右下小框**。
+  /// 用 `Icons.tv` / `picture_in_picture_alt_outlined` 只能近似，所以这两颗
+  /// 走自绘子组件，本函数负责把它们塞进同一套点击热区与间距里。
+  Widget _topActionRaw({
+    required Widget glyph,
+    required VoidCallback onTap,
+    String? label,
+    bool active = false,
+    // `#71`：小窗顶栏的墨迹间隙比全屏窄（河豚小窗 TV↔⋯ 只有 12dp 墨迹间隙），
+    // 热区不能共用全屏的 9dp，否则两件各让 9dp 会把间隙撑到 18dp。默认值保持
+    // 全屏标定值 9dp，小窗传 6dp。
+    double pad = 9,
+  }) {
+    final color = active ? AppTheme.accent : Colors.white;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        // `#72`：河豚四颗图标中心间距 117~127px（44dp 档），我方原 7+7=14dp 只给
+        // 到 96px —— 整组偏右且偏挤。改 9dp ⇒ 中心距 24+18 = 42dp = 115px，对上河豚。
+        padding: EdgeInsets.symmetric(horizontal: pad, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 墨迹尺寸由各调用点自己定（时钟 30dp 见 `_topAction(size:)`，
+            // TV / 画中画自绘 25dp，点组自绘 4.4dp×3）。这里只管把它塞进
+            // 同一套点击热区与间距；间距 9dp 已由实测把四颗中心距压到
+            // 115~125px，对上河豚 115.5~127 的区间，不再动。
+            glyph,
+            if (label != null) ...[
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _toast(String msg) {
+    final m = ScaffoldMessenger.maybeOf(context);
+    m?.showSnackBar(
+      SnackBar(
+        content: Text(msg, style: const TextStyle(fontSize: 12.5)),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  /// 底部控制条：河豚两行布局（`ROADMAP.md` #52）。
+  ///
+  /// 第一行 = 当前时间 + 进度条 + 总时长；
+  /// 第二行 = **左组四件 + 右组五件**：播放暂停 / 下一集 / 弹幕开关 / 弹幕设置 ｜
+  /// 片头片尾 / 缓冲设置 / 播放源 / 倍速 / 选集。
+  ///
+  /// 左组第 4 件在 `#52-h` 由「发弹幕输入框」换成河豚的**弹幕设置图标**，
+  /// 输入框移进设置面板顶部（河豚全屏底栏本来就没有输入框）。
+  ///
+  /// 实测坐标（画布 2340×1080，换算成 dp）：两行中心分别在 315dp 和 355dp，
+  /// 九件从 x=98dp 排到 x=819dp，输入框固定 158dp 宽、右侧五件靠右贴边。
+  Widget _buildBottomBar() {
+    final total = _s.duration;
+    final cur = _seekPreview ?? _s.position;
+
+    // 内嵌小窗只有 16:9 高（约 220dp），塞九件必然溢出 → 保持改造前的单行简版
+    if (widget.embedded) return _buildEmbeddedBar(cur, total);
+
+    // `#52-g` 转屏首帧守卫。
+    //
+    // 竖屏点全屏的那一瞬间，本页的 `embedded` 已经翻成 false，但 `MediaQuery`
+    // 还停在竖屏（392dp 宽）；九件行要排到 ~700dp，于是报
+    // `RenderFlex overflowed by 249 pixels on the right`，屏幕上闪一帧黄黑条。
+    // 河豚没有这个问题 —— 它换方向是原生 View 重排，不存在 Flutter 的
+    // 「帧内尺寸滞后」。修法不需要新写一套布局：窄了就复用简版，
+    // 一帧之后 `MediaQuery` 变成 800dp（横屏实测宽，不是 851dp），自然切回完整九件行。
+    if (MediaQuery.sizeOf(context).width < 620) {
+      return _buildEmbeddedBar(cur, total);
+    }
+    return Positioned(
+      left: 0,
+      right: 0,
+      // 上面关了 `resizeToAvoidBottomInset`，所以这里要自己把整条控制栏
+      // 抬到键盘之上，否则输入框会被键盘盖住（只有全屏态才需要）
+      //
+      // `#72` 第九次标定 —— **底栏整条下移 59px（-21.45dp）**。
+      // 第八次删掉 `padding.bottom` 里的 `MediaQuery.padding.bottom` 后重测，
+      // 按钮行墨迹**一位没动**（`_c79_bot_wide.png` 仍是 959~1002），
+      // 说明横屏沉浸下这个 inset 本来就是 0 —— 上一轮「inset 漂移」的推断在底栏
+      // 不成立，缺口另有出处。逐盒反推几何（Row 交叉轴 center，Row 底 = 内容底）：
+      //   Container 底贴屏底(1080) → 减 padding bottom 36.9px → Row 底 1043.1
+      //   Row 高 ~121px（由暂停那颗 size 33 的 IconButton 撑起）→ Row 顶 922
+      //   暂停墨迹（h52）居中 → 922 + (110-52)/2 = 956 ✓ 与实测 956 吻合
+      //   文字墨迹（h44）居中于 h92 盒 → 936.5 + 24 = 960.5 ✓ 与实测 959 吻合
+      // 河豚按钮行墨迹底是 1061（距屏底仅 19px），而它同样的 44dp 字盒若贴屏底
+      // 只能到 1080-25 = 1055 —— 也就是**河豚这一行本来就压在屏幕下沿之外**。
+      // 所以这里不是「padding 该调多少」的问题，是整条要塞出屏幕底：
+      //   缺口 = 1061 - 1002 = 59px = 21.45dp
+      // 配合 `clipBehavior: Clip.none`（见 build() 里 Stack 处）放行溢出绘制。
+      // 键盘弹起时仍以 `viewInsets` 为准，再叠这 21.45dp 的固定底偏。
+      // `#72` 第十二次标定 —— **`MediaQuery.viewInsetsOf(context).bottom` 从
+      // 公式里去掉**，和第八次删 `padding.bottom`、第七次删 `padding.top`
+      // 是同一类缺陷（运行时 inset 参与静态标定）。
+      //
+      // 第十一批到第十二批之间实测到 57~61px 的整条漂移：
+      //   ① 从详情页点「第01集」直进全屏 → 底栏右组墨迹 1020~1061（= 河豚 ✓）
+      //   ② 从竖屏小窗点「全屏」按钮进全屏 → 同一份 APK 墨迹 960~1001（偏上 60px）
+      // 两次 `dumpsys window` 的差别只在 `mAppBounds`：② 的底部留了 44px 导航区，
+      // 而 `viewInsets.bottom` 在横屏手势条态下取到 59px —— 于是
+      // `bottom = 59 - 21.45dp×2.75/2.75... = 59 - 59 = 0`，整条被抬 59px。
+      // 这个 inset 与河豚的绝对像素坐标毫无关系，只要它随窗口态变化，
+      // 底栏就永远收不了口。改死值后无论哪种进全屏路径，墨迹底恒为
+      // `1080 + 59 - 内容高`，与河豚 1061 对齐。
+      //
+      // 键盘：本栏在控制条显示时才有意义，弹幕输入走全屏浮层
+      // （`_openPanel` → `PlayerPanel.danmakuSetting`，独立 Stack 层），
+      // 不依赖这条 `bottom`，去掉 inset 项没有功能代价。
+      // 用户反馈批次 · 2026-10-30 —— **整条抬回屏内 21.45dp（`bottom: -21.45` → `0`）**。
+      //
+      // 上面这串 `#72` 标定推导的是「把墨迹钉到河豚的绝对像素 1061」，
+      // 代价是整条容器底边塞出屏幕外 21.45dp（= 59px），按钮行距屏底只剩 19px。
+      // 用户原话「底部的控制按钮太靠下」—— 河豚那个 19px 贴底量本来就贴着手势条，
+      // 1:1 复刻到这个尺寸的真机上就是「压边」，误触手势条的概率也高。
+      //
+      // 改法只动一个数：`bottom` 归 0，整条容器底边回到屏底，
+      // 按钮行墨迹从 1002 抬到 ~943（离屏底 137px = 50dp，手势条之上 28dp 呼吸位），
+      // 进度条行同步上移同样的 21.45dp —— 两行相对关系（`SizedBox(9.59)`）不动。
+      // 衬底渐变跟着整条上移，最底一条 alpha 0.94 仍然贴屏底，不会露白。
+      bottom: 0,
+      child: Container(
+        padding: EdgeInsets.only(
+          left: 10,
+          right: 10,
+          // 18dp（原 6dp）：河豚底部按钮行墨迹落在 y 953~1001，本机改前是
+          // 991~1031，整体偏低 33px = 12dp。补 12dp 后实测 961~1001，
+          // 与河豚底边 1001 精确重合（`#52-f` 二次标定）。
+          // `#52-f` 定的是 18dp，`#72` 第五次再校 3.5dp：
+          // `x76_fs.png` 我方按钮行墨迹中心 y=968.5（暂停 943~994 / 右组文字
+          // 947~990），河豚 `ht_live_fs3.png` 是 976（952~1000）/ 980.5（960~1001）
+          // ——整体偏上 7.5~12px，取中下移 3.5dp=9.6px。配合下面 `SizedBox`
+          // 同步减 3.5dp，让进度条行原地不动（只动按钮行）。
+          // `#72` 第七次标定：底栏也是**整条偏上**，与顶栏同源不同量。逐簇实测
+          // （`_c72b_ht_bot.png` vs `_c72b_my_bot.png`，切图 y0=990）墨迹中心：
+          //   河豚 右组五件 50.5（1403~1544 / 1616~1786 / 1858~1985 / 2056~2139 /
+          //                  2210~2293，ink_y 30~71，h=42）
+          //   我方 右组五件 47.5（1394~1534 / 1606~1778 / 1850~1980 / 2050~2135 /
+          //                  2206~2291，ink_y 26~69，h=44）
+          // 偏上 3px = 1.09dp，14.5 → 13.41。纵向残差 2px 来自我方字形 h=44 vs
+          // 河豚 h=42（字号略大），属下一批字号标定的范围，位置先对齐中心。
+          // `#72` 第八次标定 —— **`MediaQuery.padding.bottom` 从公式里去掉**，
+          // 这是和顶栏 `padding.top` **完全同源**的缺陷（安全区 inset 参与布局）。
+          // 第七次只把系数从 14.5 调到 13.41（上移 3px），复测整条却**偏上 54px**
+          // （`_c78_bot_wide.png`，切图 y0=900，窗口 0~180，阈值 205）：
+          //   河豚 右组五件墨迹 y 1020~1061（距屏底 19px）
+          //   我方 右组五件墨迹 y  959~1002（距屏底 78px）
+          // 而同一张图顶栏刚被 `top: -9.45` 校正到 ±1px —— 上下两栏同步偏、方向相反，
+          // 说明不是间距，是**两栏各自把系统 inset 算进了自己的定位**。
+          // 横屏手势条 inset 实测 ≈ 21dp = 59px（Android 手势导航标准值），
+          // 与 54~59px 的缺口区间吻合，故整项删除：
+          //   去掉后墨迹底 = 1080 - (78 - 59) = 1061，正好等于河豚的 19px 贴底量。
+          //
+          // `#72` 第十一次标定 —— 13.41 → 12.32（按钮行整条再下移 3px）。
+          // 第十批实测（`_c72b_ht_bot.png` vs `_c81_bot90.png`，切图 y0=990，
+          // 窗口 0~180，阈值 205）：
+          //   河豚 右组五件 ink_y 30~71（中心 50.5）
+          //   我方 右组五件 ink_y 27~68（中心 47.5）  ← 偏上 3px，字号已 1:1（h 都是 42）
+          // 逐盒反推几何验证模型（Row 底 = 容器内容底）：
+          //   容器底 = 1080 + 21.45dp×2.75 = 1139.0；减 padding 36.9 → 内容底 1102.1
+          //   Row 高 = 暂停盒 33+12 = 45dp = 123.75px → Row 中心 1102.1 - 61.9 = 1040.2
+          //   实测暂停墨迹中心 1040.5 ✓（模型误差 0.3px）；文字墨迹中心 1037.5
+          //   = Row 中心 - 2.7（CJK 字形在 1.0 行盒里偏上 2.7px，恒定偏置）
+          // ⇒ 文字组要落 1040.5 得 Row 中心 = 1043.2，即内容底 1105.1：+3px。
+          // 只动末位（按钮行），进度条行必须原地不动 —— 见下面 SizedBox 同步 +1.09dp。
+          bottom: 12.32,
+          top: 10,
+        ),
+        decoration: BoxDecoration(
+          // `#72`：底栏衬底。原为 `0.78→0.24→transparent` 三段均分，
+          // 渐变总高约 128dp，按钮行落在 0.14~0.45 区间 —— 那时 alpha 已经
+          // 掉到 0.3 上下，白片尾字幕（255）穿过衬底后还剩 ~180 灰，
+          // 糊在 `片头/尾`、`缓冲设置`、`播放源`、`1080P` 上就是用户说的「乱」。
+          // 改法：把高 alpha 段压到内容区（0~0.86），内容区最低 0.72；
+          // alpha→0 的衰减全部塞进顶部 10dp 内边距（0.96~1.0，那块没有内容），
+          // 于是文字底下始终 ≥0.72，白字幕最多剩 255×0.28≈71 灰。
+          // 对拍依据（`bar_bg_probe.py`）：河豚 `n6_full.png` 按钮行 p99=98.6，
+          // 我方改前 `r5.png` p99=206.8。
+          gradient: LinearGradient(
+            begin: Alignment.bottomCenter,
+            end: Alignment.topCenter,
+            colors: [
+              Colors.black.withValues(alpha: 0.94),
+              Colors.black.withValues(alpha: 0.86),
+              Colors.black.withValues(alpha: 0.72),
+              Colors.black.withValues(alpha: 0.42),
+              Colors.transparent,
+            ],
+            stops: const [0.00, 0.42, 0.86, 0.96, 1.00],
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _buildProgressRow(cur, total),
+            // 12dp（原 2dp）：河豚进度条行左时间墨迹中心 y 859，按钮行中心 976，
+            // 两行中心距 117px；本机改前是 909 / 1011（中心距 102px，且整体偏下）。
+            // 按钮行已经在上面用 bottom padding 上提到 976，这里再补 10dp 把
+            // 时间行抬到 859（`#52-f` 二次标定）。
+            // `#72` 第五次：12 → 8.5dp，与上面 bottom 的 18→14.5 成对，净效果是
+            // 按钮行下移 3.5dp、进度条行像素不动（列高由 `mainAxisSize.min` 决定，
+            // 末位 child 底边 = Container 内容底边，所以只让末位跟着 bottom 走、
+            // 间距反向抵消，前一位就钉住了）。
+            // `#72` 第十一次标定：8.5 → 9.59dp，与上面 padding.bottom 的
+            // 13.41 → 12.32（-1.09dp）成对，净效果 = 按钮行下移 3px、
+            // 进度条行像素不动（列高 `mainAxisSize.min`，末位 child 底边贴内容底，
+            // 间距反向抵消前一位）。
+            const SizedBox(height: 9.59),
+            _buildButtonRow(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 进度条行：`当前时间 ─────●───── 总时长`
+  Widget _buildProgressRow(Duration cur, Duration total) {
+    final max = total.inMilliseconds <= 0
+        ? 1.0
+        : total.inMilliseconds.toDouble();
+    final val = cur.inMilliseconds.clamp(0, max.toInt()).toDouble();
+    return Row(
+      children: [
+        SizedBox(
+          width: 46,
+          child: Text(
+            _fmt(cur),
+            style: const TextStyle(color: Colors.white, fontSize: 11.5),
+          ),
+        ),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 2.4,
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+              activeTrackColor: AppTheme.accent,
+              inactiveTrackColor: Colors.white24,
+              thumbColor: AppTheme.accent,
+            ),
+            child: Slider(
+              value: val,
+              max: max,
+              onChanged: (v) {
+                _cancelHide();
+                setState(
+                  () => _seekPreview = Duration(milliseconds: v.round()),
+                );
+              },
+              onChangeEnd: (v) {
+                _s.seek(Duration(milliseconds: v.round()));
+                setState(() => _seekPreview = null);
+                _scheduleHide();
+              },
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 52,
+          child: Text(
+            _fmt(total),
+            textAlign: TextAlign.right,
+            style: const TextStyle(color: Colors.white70, fontSize: 11.5),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 九件行
+  /// 右组「清晰度」按钮的文案（`#52-h③`）：当前线路的画质档位。
+  ///
+  /// 拿不到当前线路时退到第一条线路；一条都没有（离线兜底 / 老后端）时
+  /// 用河豚默认的 `720P` —— 按钮恒有字，与「播放源」的禁灰态配合。
+  String get _qualityText {
+    final cur = widget.currentSource;
+    if (cur != null) return cur.quality;
+    if (widget.sources.isNotEmpty) return widget.sources.first.quality;
+    return kQualityFallback;
+  }
+
+  Widget _buildButtonRow() {
+    final hasEpisodes = widget.episodeGroups.isNotEmpty;
+
+    return Row(
+      children: [
+        // 左组整体起始位移。河豚 7.0.0.2 实测（PIL 列扫描 @2340×1080）：
+        //   暂停 bars 269~315（中心 292）/ 下一集 429~470（449.5）/
+        //   弹 564~616（590）/ 设置 714~770（742）
+        // 我方改前 181 / 285.5 / 383 —— 整体左移 111px(=40dp) 且间距紧 15dp。
+        // 只给**按钮行**补位移，不动外层 Container 的 padding：动外层会把
+        // 上面那行进度条（`01:56` 起点）一起推走。
+        //
+        // `#72` 二次标定：四件**中心**本来已经对齐（我方 291/448/742.5 vs
+        // 河豚 292.5/449.5/742.5，误差 ≤1.5px），但**墨迹**比河豚小一档 ——
+        // 河豚暂停 bars 45×48px、下一集 42×46px；我方 35×41px、29×29px。
+        // 原因是 Material 字形自带 padding，`size` 给的是盒高不是墨迹高。
+        // 逐件折算：暂停 26 → 33dp（墨迹 35→44px）、下一集 22 → 32dp（29→42px）。
+        // 盒子变宽会把后面的件往右推，所以前导位移 40 → 36.5、两处间距
+        // 19 → 10.5 / 16 → 11，把「暂停 / 下一集 / 弹 / 设置」四个中心钉回原位
+        // （盒宽 = size + 2×7dp 内边距）：
+        //   暂停中心 = 36.5 + 47/2 = 60dp ←= 40 + 40/2
+        //   下一集中心 = 36.5 + 47 + 10.5 + 46/2 = 117dp ←= 40+40+19+36/2
+        //   弹起点 = 36.5+47+10.5+46 = 140dp ←= 40+40+19+36+16 - 5（s2 抵掉）
+        const SizedBox(width: 36.5),
+        // `#72` 第十一次标定 —— 左组四件整体上移 2.65dp（7.3px）。
+        //
+        // 根因不是「谁算错了」，是**两类盒子的墨迹偏置不同**：图标件墨迹中心
+        // = 盒中心；文字件（CJK、height 1.0 行盒）墨迹中心 = 盒中心 - 2.7px。
+        // 两边共处一个 `Row`（交叉轴 center）就必然差 2.7px，而河豚的差值是反向的：
+        //   河豚 暂停中心 1036 / 下一集 1035.5 / 齿轮 1036.5 · 文字 1040.5
+        //   我方 暂停中心 1040.5 / 下一集 1039.5 / 齿轮 1040  · 文字 1037.5
+        // 即河豚图标件比文字件高 4.5px，我方低 3px —— 相对差 7.5px。
+        // 右组用 padding.bottom 落位后（见上），图标件还要再单独上提：
+        //   `Transform.translate` 只改绘制不改布局（不参与 `Row` 盒计算），
+        //   所以四件的盒宽/盒高/间距一位不动，横向标定结果不会被这次纵向修正污染。
+        Transform.translate(
+          offset: const Offset(0, -2.65),
+          child: _iconBtn(
+            icon: _s.completed
+                ? Icons.replay
+                : (_s.playing ? Icons.pause : Icons.play_arrow_rounded),
+            size: 33,
+            glyph: _s.playing ? _pauseGlyph(33) : null,
+            onTap: _togglePlay,
+          ),
+        ),
+        const SizedBox(width: 10.5),
+        // 2) 下一集（最后一集置灰）
+        Transform.translate(
+          offset: const Offset(0, -2.65),
+          child: _iconBtn(
+            icon: Icons.skip_next,
+            size: 32,
+            enabled: widget.onNextEpisode != null,
+            onTap: widget.onNextEpisode,
+          ),
+        ),
+        const SizedBox(width: 11),
+        // 3) 弹幕开关（河豚的自绘「弹」方块）
+        Transform.translate(
+          offset: const Offset(0, -2.65),
+          child: _DanmuToggle(
+            on: widget.danmakuOn,
+            onTap: widget.onDanmakuToggle == null
+                ? null
+                : () => widget.onDanmakuToggle!(!widget.danmakuOn),
+          ),
+        ),
+        // `#72` 第五次标定：弹→设置 间距 20 → 14dp。
+        // 实测：我方弹幕方块墨迹落在 x563~617、河豚 563~613 —— 方块**位置全对**，
+        // 偏差全出在这段间距上，把齿轮顶到了 735~789（河豚 715~770）。
+        // 这 20px 由两处吃掉：本 SizedBox 减 6dp（-16.5px）+ 下一件 `_dmSettingBtn`
+        // 的图标盒从 22dp 收到 20.7dp（-3.6px），合计 -20.1px。
+        // `#72` 第十二次标定 —— 14.0 → 12.91dp（齿轮左移 3px）。
+        // 第十一批逐簇实测（`_c82_bot90.png` vs `_c72b_ht_bot.png`，切图 y0=990）：
+        //   齿轮 河豚 715~770（中心 742.5）  我方 718~772（中心 745）  ← 偏右 3px
+        // 3px / 2.75 = 1.09dp。齿轮左移同时把右邻的胶囊一起带左 3px，
+        // 胶囊侧只需再补另一半（见下面 22.9 → 21.8 的解释）。
+        const SizedBox(width: 12.91),
+        // 4) 弹幕设置（`#52-h`）。河豚左组第 4 项就是这个「三条递减横杠 + 齿轮」图标，
+        //    **不是输入框** —— 实测见 `shots/h10_zoom_leftgrp.png`：暂停 / 下一集 /
+        //    弹(开关) / 设置 四件，之后直接跳到右边的文字组。我方原来这里放的是
+        //    发弹幕输入框，跟基准差了整整一件，输入框移进设置面板顶部。
+        //
+        //    注意：**弹幕关着也要显示**（河豚的「弹」带斜杠时这个图标照常存在），
+        //    唯一区别是面板顶部的发弹幕输入条会一起消失。
+        Transform.translate(
+          offset: const Offset(0, -2.65),
+          child: _dmSettingBtn(),
+        ),
+        // 5) 弹幕输入胶囊（`#72` 第四次标定 · 回归 1:1）。
+        //
+        // 三簇互动角标（♡/💬/★）已撤出全屏底栏。撤除依据是**真机现拍**：
+        // `ht_live_fs3.png`（河豚 7.0.0.2 沉浸全屏、控制条 ON）逐列墨迹扫描，
+        // 底栏只有 9 簇 —— 左段 4 件（暂停双条 270~315 / 下一集 429~470 /
+        // 弹幕开关(红色，不达白阈值故不进簇) / 齿轮 715~770），右段 5 件
+        // （1403~2293）。770~1403 这 633px 之间**没有第三个白簇**。
+        // 之前把三簇塞在这里，是拿「非沉浸横屏」UI 的 `ref_left.png` 当基准，
+        // 那条 730px 空位在河豚沉浸全屏里本来就不是空的 —— 那里躺着**弹幕输入框**。
+        //
+        // 胶囊实测（`ht_live_fs3.png` + `_z_ht_capsule_ruler.png` 5× 刻度）：
+        //   左缘 x≈855 / 右缘 x≈1095 / w≈240px=87dp；上缘 y≈938 / 下缘 y≈998 /
+        //   h≈59px=21.5dp；四角全圆（半径 = h/2 = 11dp）。
+        //   内文「发个弹幕吧~」墨迹 x899~1058（w160px）、y960~989（h30px）
+        //   ⇒ fontSize ≈ 33px/2.75 = **12dp**，左内边距 899-855 = 44px = 16dp。
+        //   填充是**极低透明度**白（叠在深色视频上几乎看不出，叠在亮画面上
+        //   才显形）—— 逐列均值只抬 8~10，反推 alpha ≈ 0.07。
+        //   齿轮墨迹右缘 770 → 胶囊左缘 855，空白 85px = 31dp。
+        //
+        // `#72` 第六次标定：这 31dp 是**视觉空白**，不是 SizedBox 该给的值。
+        // 齿轮 ink 右缘 770 之后还有 `_dmSettingBtn` 的 `Padding(horizontal: 8)`
+        // = 22px 的隐形边框，所以：
+        //   770 + 22(右 padding) + N = 855  ⇒  N = 63px = 22.9dp
+        // （上一版直接写 31dp 会把胶囊推到 877，右溢 22px。）
+        //
+        // 弹幕关掉时河豚会把这条输入一起收走（只剩齿轮），所以按
+        // `widget.danmakuOn` 条件渲染，这段空格也跟着一起进出。
+        if (widget.danmakuOn) ...[
+          // `#72` 第十二次标定 —— 22.9 → 21.8dp（胶囊再左移 3px）。
+          // 第十一批 bbox 实测：我方胶囊内文墨迹左缘 905、河豚 898 —— 偏右 7px。
+          // 拆账：4px 在胶囊自身的左内边距（我方 16dp=44px、河豚 43px=15.6dp，
+          // 见 `_DanmuInputPill`），余 3px 在这里；齿轮那边已经贡献了 3px
+          // （14.0 → 12.91），所以本间距只需再减 3px = 1.09dp。
+          const SizedBox(width: 21.8),
+          // 以下这段是 `#72` 第十二次标定的原始推导，**已被 2026-10-30 用户反馈推翻**，
+          // 保留是因为它记录了「河豚胶囊本来浮在按钮行上方 24.18dp」这个事实
+          //（下次要回河豚 1:1 形态时按这个数回滚即可）。
+          //
+          // `#72` 第十二次标定 —— 胶囊是**独立悬浮层，比按钮行高 66.5px**。
+          //
+          // 第十一批 `bbox()` 实测（`x82_fs.png` vs 河豚同窗口、阈值 205）：
+          //   河豚 胶囊内文 y960~989（中心 974.5）· 右组文字 y1020~1061（中心 1040.5）
+          //   我方 胶囊内文 y1027~1055（中心 1041）· 右组文字 y1020~1061（中心 1040.5）
+          // ⇒ 右组文字已 1:1 重合，胶囊却塌在按钮行中线上；河豚的胶囊比按钮行
+          //   整整高 66.5px = 24.18dp。河豚胶囊盒实测 855~1095 × 938~998
+          //   （87×21.5dp），底边 998 距文字顶边 1020 还留 22px = 8dp 空气 ——
+          //   它是浮层，不是这一行的行内件。把它塞进 `Row` 就必然被交叉轴
+          //   center 拉到 1040，这就是 67px 偏差的唯一根因。
+          // 不动布局结构：移出 `Row` 会改掉 `Spacer` 之后的横向标定。用
+          // `Transform.translate` 只改绘制（不参与 `Row` 盒计算），盒的位置、
+          // 宽度、与齿轮的间距一位不动，横向结果零污染。上方 `bottom: 12.32`
+          // 与 `SizedBox(9.59)` 已定的按钮行位置也不受影响。
+          // 用户反馈批次 · 2026-10-30 —— **抬升量 24.18 → 2.65dp**。
+          //
+          // 原来 -24.18dp 是把它当「浮层」画在按钮行上方（河豚实测胶囊盒
+          // 855~1095 × 938~998，底边距文字顶边还留 22px），代价是它飘在
+          // 一排图标（暂停 / 下一集 / 弹 / 齿轮）头顶半格的位置，
+          // 用户原话「全屏中弹幕输入窗口太靠上」。
+          //
+          // 现在改成与左组其它四件**同一个视觉基线**：左组每件都是
+          // `Transform.translate(0, -2.65)`，胶囊用同一个量 ⇒ 一行五件横平竖直，
+          // 它从「浮层」变回「行内件」。横向标定不受影响（Transform 不参与 Row 盒计算）。
+          Transform.translate(
+            offset: const Offset(0, -2.65),
+            child: _DanmuInputPill(
+              onTap: () => _openPanel(PlayerPanel.danmakuSetting),
+            ),
+          ),
+        ],
+        const Spacer(),
+        // 右组五件是**中文文字**不是图标（`ROADMAP.md` #52-f）。
+        //
+        // 河豚 7.0.0.2 真机实测（2340×1080 画布，PIL 逐字墨迹扫描）：
+        // 文字块 `x0~x1` / 块宽 / 墨迹高 42px / 块中心：
+        //   片头/尾  1401~1545 / 145 / 中心 1473
+        //   缓冲设置 1615~1787 / 173 / 中心 1701
+        //   播放源   1857~1986 / 130 / 中心 1921
+        //   倍速     2055~2139 /  85 / 中心 2097
+        //   选集     2210~2293 /  84 / 中心 2251
+        // **相邻块之间的空白恒为 69px = 25dp**（四档 69/69/68/70 全一致），
+        // 右端「选集」墨迹右缘距屏右边 47px = 17dp。
+        // 所以河豚用的就是 `Row + SizedBox(25)` 的右对齐排布，不是中心等距 ——
+        // 五块宽度各不相同（145~173px），中心等距只是这件副产物。
+        _textBtn('片头/尾', onTap: () => _openPanel(PlayerPanel.skip)),
+        // `#72` 第十一次标定 —— 25 → 24dp（四处）。
+        // 第十批逐簇实测墨迹间距（`_c72b_ht_bot.png` vs `_c81_bot90.png`）：
+        //   河豚 72 / 72 / 71 / 71（四档一致）  我方 75 / 75 / 74 / 73
+        // 第十次把字号 17.5→16.7、字距 -1.6→-0.45 修高度时，每字多出 1.15dp 的
+        // **尾部 advance**（墨迹看不见、盒宽看得见），把四个空隙各撑大 ~2.75px。
+        // 减 1dp（2.75px）回到 72/72/71/70.5，与河豚差 ≤1px。
+        const SizedBox(width: 24),
+        // 6) 缓冲设置
+        _textBtn('缓冲设置', onTap: () => _openPanel(PlayerPanel.buffer)),
+        // `#72` 第十一次标定 —— 25 → 24dp（四处）。
+        // 第十批逐簇实测墨迹间距（`_c72b_ht_bot.png` vs `_c81_bot90.png`）：
+        //   河豚 72 / 72 / 71 / 71（四档一致）  我方 75 / 75 / 74 / 73
+        // 第十次把字号 17.5→16.7、字距 -1.6→-0.45 修高度时，每字多出 1.15dp 的
+        // **尾部 advance**（墨迹看不见、盒宽看得见），把四个空隙各撑大 ~2.75px。
+        // 减 1dp（2.75px）回到 72/72/71/70.5，与河豚差 ≤1px。
+        const SizedBox(width: 24),
+        // 7) 播放源
+        //
+        // `#72` 更正：这里原来写 `enabled: sources.length > 1`，只有一条线路时
+        // 整颗灰掉（0.3 白 ⇒ min-channel 87）。两条证据推翻它：
+        //   ① 基准图 `h10_fullbar.png` 同带实测「播放源」峰值 255，与
+        //      `片头/尾` `缓冲设置` `倍速` `选集` 四件完全一致 —— 基准里它不灰；
+        //   ② `#72` 把清晰度入口撤出底栏、收进本面板顶部后，一旦灰掉就
+        //      **点不进画质档位**，单线路用户从此无法换清晰度（功能性回归）。
+        // 所以改成恒白恒可点：面板里恒有内容（画质行 + 线路列表，列表可空）。
+        _textBtn(
+          '播放源',
+          onTap: () => _openPanel(PlayerPanel.source),
+        ),
+        // `#72` 第十一次标定 —— 25 → 24dp（四处）。
+        // 第十批逐簇实测墨迹间距（`_c72b_ht_bot.png` vs `_c81_bot90.png`）：
+        //   河豚 72 / 72 / 71 / 71（四档一致）  我方 75 / 75 / 74 / 73
+        // 第十次把字号 17.5→16.7、字距 -1.6→-0.45 修高度时，每字多出 1.15dp 的
+        // **尾部 advance**（墨迹看不见、盒宽看得见），把四个空隙各撑大 ~2.75px。
+        // 减 1dp（2.75px）回到 72/72/71/70.5，与河豚差 ≤1px。
+        const SizedBox(width: 24),
+        // 7b) 清晰度按钮已从底栏**撤出**（`#72`）。
+        //
+        // `#52-h③` 当初把它作为右组第六件插进来（当时的裁决是 R3 路线），
+        // 但 `#72` 用户拿真机截图对比后说「有点乱」——根因就在这里：
+        // 河豚右组只有五块（片头/尾 · 缓冲设置 · 播放源 · 倍速 · 选集），
+        // 我方六块。`w72d_t00.png` 逐列墨迹扫描实测 6 簇
+        // （1206~1347 / 1419~1590 / 1662~1792 / **1865~1980 1080P** / 2050~2135 / 2206~2291），
+        // 河豚同带只有 5 簇（1403~1544 / 1616~1786 / 1858~1985 / 2056~2139 / 2210~2293）。
+        // 多出来那块 1080P 把右组整体左推 197px，五块之间 25dp 的呼吸感被压掉，
+        // 视觉上就是「挤成一片」。
+        //
+        // 功能不丢：入口移到「播放源」面板顶部一行（画质档位本质就是选线路的
+        // 一个维度，河豚自己的画质也是跟源绑在一起的），见 [SourcePanel.qualityLabel]。
+        // 8) 倍速（河豚此项恒为「倍速」二字，开过非 1.0 也不变色，忠于基准）
+        _textBtn('倍速', onTap: () => _openPanel(PlayerPanel.rate)),
+        // `#72` 第十一次标定 —— 25 → 24dp（四处）。
+        // 第十批逐簇实测墨迹间距（`_c72b_ht_bot.png` vs `_c81_bot90.png`）：
+        //   河豚 72 / 72 / 71 / 71（四档一致）  我方 75 / 75 / 74 / 73
+        // 第十次把字号 17.5→16.7、字距 -1.6→-0.45 修高度时，每字多出 1.15dp 的
+        // **尾部 advance**（墨迹看不见、盒宽看得见），把四个空隙各撑大 ~2.75px。
+        // 减 1dp（2.75px）回到 72/72/71/70.5，与河豚差 ≤1px。
+        const SizedBox(width: 24),
+        // 9) 选集
+        _textBtn(
+          '选集',
+          enabled: hasEpisodes,
+          onTap: () => _openPanel(PlayerPanel.episodes),
+        ),
+        // 末尾 7dp：河豚「选集」墨迹右缘距屏边 47px = 17dp，但外层 `Container`
+        // 已经自带 `right: 10` 的 padding，所以这里只需要补 17 - 10 = 7dp。
+        // 真机复测（`#52-f` 二次标定，2340×1080）：改前整组比河豚左移 33px，
+        // 改后五块墨迹右缘落在 2293，与河豚 2293 完全重合。
+        //
+        // `#72` 第十一次标定：7 → 5.55dp。第十批复测「选集」墨迹右缘 2289，
+        // 河豚 2293 —— 整组还差 4px 才贴到位（字距改动后每块多出的尾部
+        // advance 让整组变宽 19px，右端被 `Spacer` 顶着只能往左溢出）。
+        // 4px / 2.75 = 1.45dp。
+        const SizedBox(width: 5.55),
+      ],
+    );
+  }
+
+  /// 底部右组的功能项：中文文字按钮（河豚 7.0.0.2 实测是文字，`ROADMAP.md` #52-f）。
+  ///
+  /// 尺寸标定（画布 px ÷ 2.75 = dp）：
+  /// - 单字 advance ≈ 42~43px = 15.5dp，墨迹高 42px = 15.3dp —— 墨迹几乎满格，
+  ///   说明河豚的字面比 `Noto Sans CJK` 更满。`fontSize 17.5 + letterSpacing -1.6`
+  ///   在系统默认字体下能同时压到「advance 43px、墨迹 42px」。
+  /// - 垂直内边距 8dp 只为扩大点击区，不影响行高对齐（`Row` 按基线居中）。
+  /// - 不用 `InkResponse` 的水波纹：全屏控制条上闪一下红圈太吵，河豚也没有。
+  Widget _textBtn(
+    String label, {
+    required VoidCallback? onTap,
+    bool enabled = true,
+  }) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: enabled ? onTap : null,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Text(
+          label,
+          style: TextStyle(
+            // 禁用态 0.3 白只留给「选集」（没有分集时确实无内容可给）。
+            // `#72` 更正：`播放源` 不再走这条 —— 基准里它是 255 白，
+            // 且画质入口住在那个面板里，见 `_buildButtonRow` 第 7 项。
+            color: enabled ? Colors.white : Colors.white.withValues(alpha: 0.3),
+            // `#72` 第十次标定（右组五件**逐件墨迹宽高**对拍，阈值 205）：
+            //   河豚 `_c72b_ht_bot.png` 五件宽 141/170/127/83/83、墨迹高 42
+            //   我方 `_c80_bot_wide.png` 五件宽 140/172/130/86/85、墨迹高 44
+            // 高度多 2px（44/42 = 1.048 ⇒ 17.5 × 42/44 = 16.7dp），宽度却基本
+            // 相等 —— 说明我方字面「偏窄偏高」，只降字号会把整组缩窄。
+            // 两边同时动：字号 17.5→16.7 把墨迹高压回 42，字距 -1.6→-0.45
+            // 把省掉的横向 advance 补回去（Flutter 的字距按**每字**加，4 字块
+            // 少 3 个间隙 ⇒ 每字 +0.37dp = +1px，五块分别回到 145/173/130/85/84）。
+            //
+            // `#72` 第十二批二次收敛（`-0.45 → -0.68`）：
+            // 真全屏 `y04.png` 逐簇 bbox（三阈值 180/205/230 交叉验证，排除背景
+            // 视频亮部污染）实测右组五件墨迹左缘，右端「选集」钉死做锚点：
+            //   改前 -0.45  差 -8 / -6 / -4 / -2 /  0
+            //   改后 -0.80  差 +5 / +3 / +2 / +1 / +1   ← 过冲
+            // `letterSpacing` 单位是 dp，×2.75 才是 px，所以 -0.35dp 折算
+            // 每字符 0.96px，我上一版按 1:1 估成 0.35px —— 位移是预期的 2.75 倍。
+            // 线性回插：x = -0.45 - 0.35×(8/13 | 6/9 | 4/6 | 2/3) ≈ -0.68
+            // （四项独立算出 -0.665 ~ -0.683，一致）。
+            // 预期残差 ≤0.7px；「选集」因末字 advance 变化会偏 +0.7px，可接受。
+            fontSize: 16.7,
+            letterSpacing: -0.68,
+            fontWeight: FontWeight.w500,
+            height: 1.0,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 内嵌小窗的简版单行控制条（详情页顶部用，只有 220dp 高）
+  Widget _buildEmbeddedBar(Duration cur, Duration total) {
+    final max = total.inMilliseconds <= 0
+        ? 1.0
+        : total.inMilliseconds.toDouble();
+    final val = cur.inMilliseconds.clamp(0, max.toInt()).toDouble();
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: Container(
+        padding: EdgeInsets.only(
+          left: 4,
+          right: 4,
+          bottom: MediaQuery.of(context).padding.bottom + 2,
+          top: 10,
+        ),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.bottomCenter,
+            end: Alignment.topCenter,
+            colors: [Colors.black.withValues(alpha: 0.72), Colors.transparent],
+          ),
+        ),
+        child: Row(
+          children: [
+            const SizedBox(width: 2),
+            IconButton(
+              icon: Icon(
+                _s.playing ? Icons.pause : Icons.play_arrow_rounded,
+                color: Colors.white,
+                size: 24,
+              ),
+              onPressed: _togglePlay,
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+            ),
+            Text(
+              _fmt(cur),
+              style: const TextStyle(color: Colors.white, fontSize: 11),
+            ),
+            Expanded(
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 2.4,
+                  thumbShape: const RoundSliderThumbShape(
+                    enabledThumbRadius: 6,
+                  ),
+                  overlayShape: const RoundSliderOverlayShape(
+                    overlayRadius: 12,
+                  ),
+                  activeTrackColor: AppTheme.accent,
+                  inactiveTrackColor: Colors.white24,
+                  thumbColor: AppTheme.accent,
+                ),
+                child: Slider(
+                  value: val,
+                  max: max,
+                  onChanged: (v) {
+                    _cancelHide();
+                    setState(
+                      () => _seekPreview = Duration(milliseconds: v.round()),
+                    );
+                  },
+                  onChangeEnd: (v) {
+                    _s.seek(Duration(milliseconds: v.round()));
+                    setState(() => _seekPreview = null);
+                    _scheduleHide();
+                  },
+                ),
+              ),
+            ),
+            Text(
+              _fmt(total),
+              style: const TextStyle(color: Colors.white70, fontSize: 11),
+            ),
+            IconButton(
+              icon: Icon(
+                _isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                color: Colors.white,
+                size: 21,
+              ),
+              onPressed: _toggleFullscreen,
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+            ),
+            const SizedBox(width: 2),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 控制条上的图标按钮（可带角标文字）
+  Widget _iconBtn({
+    required IconData icon,
+    required VoidCallback? onTap,
+    double size = 22,
+    bool enabled = true,
+    String? badge,
+    // 自绘字形替代 `Icon`（`#72` 第十一次标定）。Material 的 `pause` 字形
+    // 比例与河豚不一致：size 33（=90.75px em）出墨迹 45×52，河豚 46×49 ——
+    // 高度多 3px 且两条杠偏宽内距偏窄（我方杠宽 14 / 内距 17，河豚 12 / 23）。
+    // 自绘后尺寸由 dp 直给，不再受字形 em 比例牵制；外形尺寸仍取 `size`，
+    // 保证 `Row` 交叉轴高度和左右盒宽与改前**完全一致**（不牵动兄弟件）。
+    Widget? glyph,
+  }) {
+    final color = enabled ? Colors.white : Colors.white.withValues(alpha: 0.28);
+    return InkResponse(
+      onTap: enabled ? onTap : null,
+      radius: 22,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            glyph ?? Icon(icon, color: color, size: size),
+            if (badge != null) ...[
+              const SizedBox(width: 1),
+              Text(
+                badge,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 暂停双条自绘字形（`#72` 第十一次标定）。
+  ///
+  /// 河豚基准（`_c72b_ht_bot.png`，阈值 205，切图 y0=990）：
+  ///   杠 A x270~281 (12px) / 杠 B x304~315 (12px) / 内距 23px / 墨迹高 49px
+  /// 我方改前（Material `Icons.pause`，size 33dp = 90.75px em）：
+  ///   杠宽 14 / 内距 17 / 总宽 45 / 墨迹高 52 —— 字形自带比例钉死，`size`
+  ///   只能整体缩放，压高度必缩宽度（33→31 会把总宽压到 42，比河豚窄 4px）。
+  /// 所以改用两根直给的圆角条：
+  ///   4.3dp×2.75 = 11.8px 杠宽 · 8.1dp = 22.3px 内距 · 17.8dp = 49px 杠高
+  ///   ⇒ 总墨迹 11.8+22.3+11.8 = 45.9px（河豚 46）/ 49px（河豚 49）
+  /// 外层 `SizedBox(size, size)` 复刻原 `Icon` 的外形尺寸，`Row` 交叉轴高度
+  /// 与左右盒宽保持不变 —— 兄弟件一位不动。
+  Widget _pauseGlyph(double size) {
+    Widget bar() => Container(
+          // `#72` 第十二批补宽：真全屏实测双条各 11px，河豚 12px
+          // （我方 269~279 / 303~313 vs 河豚 270~281 / 304~315）。
+          // 4.3→4.5dp = 12.4px，内距 8.1→8.0dp = 22px（河豚 22px），
+          // 总墨迹 12.4+22+12.4 = 46.4px（河豚 46），右缘 281 / 315 对齐。
+          width: 4.5,
+          height: 17.8,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(1.3),
+          ),
+        );
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Center(
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [bar(), const SizedBox(width: 8.0), bar()],
+        ),
+      ),
+    );
+  }
+
+  /// 弹幕设置按钮：河豚实测是「三条圆头横杠 + 右下一颗六边形齿轮」。
+  ///（`shots/h10_zoom_leftgrp.png` 第 4 件，**不是文字也不是输入框**）。
+  ///
+  /// `#72` 第六次标定 —— 上一版是「三条等距细杠 + `Icons.settings`」，
+  /// 形状和盒高全不对（我方墨迹 55×53px，河豚 57×44px，且偏高 9px）。
+  /// 用 `probe_dmset.py` 对 `ht_live_fs3.png` x700~800 / y940~1010 逐行逐列
+  /// 扫描（dpr 2.75），还原出的真实结构（坐标相对图标左上角，单位 px）：
+  ///
+  ///   y955~963 (dy  0~8)  圆头杠 A x714~725(12)  + 空 3 + 圆头杠 B x729~759(31)
+  ///   y973~981 (dy 18~26) 圆头杠 C x714~737(24)
+  ///   y990~998 (dy 35~43) 圆头杠 D x714~727(14)  + 空 3 + 圆点 E   x731~739(9)
+  ///   六边形  x738~770 / y969~998 (33×30)，中心挖圆孔 x751~758 / y980~987 (8×8)
+  ///
+  /// 六边形是**左右尖角、上下平边**（顶边宽 16px ≈ 0.47×w，腰最宽 34px），
+  /// `Icons.settings` 的八齿圆齿轮造型差得远，所以整块改用 CustomPaint 画。
+  /// 画布 20.7×16.0dp，内部按 57×44px 的坐标系等比缩放 —— 数值直接写死，
+  /// 避免再出现「盒高给 22 但墨迹 53」那类盒/墨迹脱耦。
+  Widget _dmSettingBtn() {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => _openPanel(PlayerPanel.danmakuSetting),
+      child: const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        child: SizedBox(
+          width: 20.7,
+          height: 16.0,
+          child: CustomPaint(painter: _DmSettingGlyphPainter()),
+        ),
+      ),
+    );
+  }
+
+
+
+
+  /// 弹幕输入框（河豚固定 158dp 宽、深色圆角、右端发送）。
+  ///
+  /// [wide] = 面板里的版本：撑满面板宽度、略高一点。底栏已经不放它了
+  /// （`#52-h` 把左组第 4 项换成了设置图标），只在弹幕设置面板顶部出现。
+  Widget _buildDanmuInput({bool wide = false}) {
+    return Container(
+      width: wide ? double.infinity : 158,
+      height: wide ? 34 : 30,
+      padding: const EdgeInsets.only(left: 10, right: 4),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(wide ? 17 : 15),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _danmuCtrl,
+              focusNode: _danmuFocus,
+              textInputAction: TextInputAction.send,
+              onSubmitted: (_) => _sendDanmu(),
+              onTap: () {
+                _cancelHide();
+                _scheduleHide();
+              },
+              style: const TextStyle(color: Colors.white, fontSize: 11.5),
+              cursorColor: AppTheme.accent,
+              decoration: const InputDecoration(
+                isDense: true,
+                border: InputBorder.none,
+                contentPadding: EdgeInsets.zero,
+                hintText: '发个弹幕吧',
+                hintStyle: TextStyle(color: Colors.white38, fontSize: 11.5),
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: _sendDanmu,
+            icon: const Icon(
+              Icons.send_rounded,
+              color: Colors.white70,
+              size: 16,
+            ),
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _sendDanmu() {
+    final t = _danmuCtrl.text.trim();
+    if (t.isEmpty) return;
+    widget.onSendDanmaku?.call(t);
+    _danmuCtrl.clear();
+    _danmuFocus.unfocus();
+    // 从弹幕设置面板发的：发完把面板收掉，好让人看见自己那条飞出去
+    if (_panel == PlayerPanel.danmakuSetting) {
+      _closePanel();
+    } else {
+      _scheduleHide();
+    }
+  }
+
+  // ---------- 面板 / 锁定 / 定时 ----------
+
+  /// 弹面板：顺手把控制条钉住（面板关掉后再重新计时隐藏）
+  void _openPanel(PlayerPanel p) {
+    if (_panel == p) {
+      setState(() => _panel = PlayerPanel.none);
+      _scheduleHide();
+      return;
+    }
+    _cancelHide();
+    _danmuFocus.unfocus();
+    setState(() {
+      _panel = p;
+      _controlsVisible = true;
+    });
+  }
+
+  void _closePanel() {
+    if (_panel == PlayerPanel.none) return;
+    setState(() => _panel = PlayerPanel.none);
+    _scheduleHide();
+  }
+
+  void _toggleLock() {
+    setState(() {
+      _locked = !_locked;
+      if (_locked) {
+        _panel = PlayerPanel.none;
+      }
+    });
+    if (_locked) {
+      _cancelHide();
+    } else {
+      _scheduleHide();
+    }
+  }
+
+  void _toggleMute() {
+    final next = !_muted;
+    setState(() => _muted = next);
+    if (next) {
+      // #73：静音与竖滑音量同一口径（系统音量），避免出现
+      // 「滑动调到 0 但图标还是音量、或点了静音系统还在响」。
+      // 静音前回读真实档位：`_sysVolumeCache` 是浮点百分比，直接当恢复值
+      // 会因插件截断掉一档（实测 7 → 静音 → 取消 → 6）。
+      // 恢复时统一走 `_applySystemVolume()`（内部补半档偏置），现已闭环。
+      FlutterVolumeController.getVolume().then((v) {
+        if (v == null) {
+          _volBeforeMute = _sysVolumeCache <= 0 ? 100 : _sysVolumeCache;
+        } else {
+          final real = (v * 100).clamp(0.0, 100.0);
+          _volBeforeMute = real <= 0 ? 100.0 : real;
+        }
+        _sysVolumeCache = 0;
+        _applySystemVolume(0);
+      }).catchError((Object _) {
+        _volBeforeMute = _sysVolumeCache <= 0 ? 100 : _sysVolumeCache;
+        _sysVolumeCache = 0;
+        _applySystemVolume(0);
+      });
+    } else {
+      final back = _volBeforeMute <= 0 ? 100.0 : _volBeforeMute;
+      _sysVolumeCache = back;
+      _applySystemVolume(back);
+    }
+  }
+
+  /// 倍速：引擎 + 内存 + 设置三处一起改（落盘是为了下次进来还是这一档）
+  void _applyRate(double v) {
+    setState(() {
+      _rate = v;
+      _panel = PlayerPanel.none;
+    });
+    _s.setRate(v);
+    Settings.setPlaybackRate(v);
+    _scheduleHide();
+  }
+
+  /// 缓冲：引擎 + 设置
+  void _applyBuffer(int secs) {
+    setState(() {
+      _bufferSecs = secs;
+      _panel = PlayerPanel.none;
+    });
+    unawaited(_s.applyBuffer(secs));
+    Settings.setBufferSecs(secs);
+    _scheduleHide();
+  }
+
+  // ---------- 弹幕设置四项（`#52-h`） ----------
+  //
+  // 与倍速/缓冲不同：**不关面板**。河豚的弹幕设置是一边拖一边看效果，
+  // 关掉面板就等于把「即时预览」这个卖点砍了。
+
+  void _applyDmFont(double v) {
+    setState(() => _dmFontSize = v);
+    Settings.setDanmakuFontSize(v);
+    _cancelHide();
+  }
+
+  void _applyDmArea(double v) {
+    setState(() => _dmArea = v);
+    Settings.setDanmakuArea(v);
+    _cancelHide();
+  }
+
+  void _applyDmSpeed(double v) {
+    setState(() => _dmSpeed = v);
+    Settings.setDanmakuSpeed(v);
+    _cancelHide();
+  }
+
+  void _applyDmOpacity(double v) {
+    setState(() => _dmOpacity = v);
+    Settings.setDanmakuOpacity(v);
+    _cancelHide();
+  }
+
+  /// 片头尾：拖动过程中只改内存，松手（关面板）才落盘 ——
+  /// 每拖一格都写 SharedPreferences 会把磁盘写穿。
+  void _applySkip(Duration head, Duration tail) {
+    _s.skipHead = head;
+    _s.skipTail = tail;
+  }
+
+  void _persistSkip() {
+    Settings.setSkipHeadSecs(_s.skipHead.inSeconds);
+    Settings.setSkipTailSecs(_s.skipTail.inSeconds);
+  }
+
+  /// 定时关闭：到点**暂停播放**（河豚不是退出播放页）
+  void _setSleep(Duration? d) {
+    _sleepTick?.cancel();
+    _sleepTick = null;
+    setState(() {
+      _sleepLeft = d;
+      _panel = PlayerPanel.none;
+    });
+    if (d == null) return;
+    _sleepTick = Timer.periodic(const Duration(seconds: 1), (t) {
+      final left = _sleepLeft;
+      if (left == null) {
+        t.cancel();
+        return;
+      }
+      final next = left - const Duration(seconds: 1);
+      if (next <= Duration.zero) {
+        t.cancel();
+        _sleepTick = null;
+        setState(() => _sleepLeft = null);
+        _s.pause();
+        _toast('定时关闭：已暂停播放');
+        return;
+      }
+      setState(() => _sleepLeft = next);
+    });
+  }
+
+  /// 侧栏竖排按钮（左：锁定；右：静音）—— 河豚实测贴两侧边缘、垂直居中
+  ///
+  /// `#80` 像素级标定（`shots/ht10/ht_full_ctrl.png`，2340×1080，河豚全屏带控制条）：
+  /// 上一轮把这一排判成「河豚无锁 ⇒ 我方自研」，是因为扫描窗口给成 `x=0..220`，
+  /// 而河豚锁的笔画 bbox 是 `x221..284` —— 左边只差 1px 就落在窗口外，整件漏检。
+  /// 窗口放宽到 `x=0..450` 后两侧都出来了：
+  ///   左锁（开锁，描边、**无钥匙孔**）：x221..284 y505..575（64×71px），中心 (252.5, 540.0)
+  ///   右静音（喇叭描边 + 叉）：x2151..2220 y512..568（70×57px），中心 (2185.5, 540.0)
+  /// 垂直中心 y=540 = 1080/2 ⇒ 两侧都精确居中，与我方一致（我方 yc 538/539，Δ≤2px）。
+  ///
+  /// 水平方向差 85px：河豚图标中心距窗口边缘 **55.8dp（左）/ 56.2dp（右）**，
+  /// 我方只有 25dp（`left:2 + margin4 + width38/2`）。
+  /// 窗口坐标系见 `#72` 探针：`left:0` 对应屏幕 x=99px（左挖孔区在窗口外）。
+  /// 反算验证：`99 + (2+4+19)*2.75 = 167.75px` vs 实测 167.5px ✓，模型可信。
+  /// ⇒ `left/right = 目标距边 − margin4 − width38/2`：
+  ///   左 `55.82 − 23 = 32.82`，右 `56.18 − 23 = 33.18`。
+  ///
+  /// 图标尺寸 `19 → 30`：按「笔画高 / 图标框高」比例反推，河豚锁 71px、喇叭 57px，
+  /// 除以我方 19dp 框下同图标笔画占比（0.861 / 0.708）得框高 82.5px / 80.5px
+  /// ⇒ **29.3~30.0dp，两个图标独立指向 30**。
+  ///
+  /// 颜色 `white70 → white`：河豚笔画峰值 `#FFFFFF`(255)，我方 `#B3B3B3`(179 = 255×0.7)。
+  ///
+  /// 图标形状：`#80` 改自绘 —— 河豚锁身内区全空（y41..66 逐行 n=12 只含左右两栏）
+  /// ⇒ 无钥匙孔，且宽高比 64:71；右图标是**描边喇叭 + 独立叉**，5 张全屏样本
+  /// 逐像素一致 ⇒ 恒定字形。详见 `player_side_glyphs.dart`。
+  Widget _buildSideButtons() {
+    return Stack(
+      children: [
+        Positioned(
+          left: 32.8,
+          top: 0,
+          bottom: 0,
+          child: Center(
+            child: _sideBtn(
+              glyph: PlayerLockGlyph(
+                locked: _locked,
+                color: _locked ? AppTheme.accent : Colors.white,
+              ),
+              onTap: _toggleLock,
+            ),
+          ),
+        ),
+        Positioned(
+          right: 33.2,
+          top: 0,
+          bottom: 0,
+          child: Center(
+            child: _sideBtn(
+              glyph: const PlayerMuteGlyph(color: Colors.white),
+              onTap: _toggleMute,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sideBtn({
+    IconData? icon,
+    Widget? glyph,
+    required VoidCallback onTap,
+    bool active = false,
+  }) {
+    return InkResponse(
+      onTap: onTap,
+      radius: 24,
+      child: Container(
+        width: 38,
+        height: 38,
+        margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.34),
+          shape: BoxShape.circle,
+        ),
+        // `#80`：38×38 盒固定不变，只换字形，故按钮中心不移动（AppTheme.accent
+        // 仍在锁定态生效）。`icon` 保留给其它调用点兜底。
+        child: glyph ??
+            Icon(
+              icon,
+              color: active ? AppTheme.accent : Colors.white,
+              size: 30,
+            ),
+      ),
+    );
+  }
+
+  /// 锁屏态：只剩一个解锁按钮，其它一律不画（河豚同款）
+  ///
+  /// `#80`：`left` 由 2 改 32.8，与未锁定态同轴 —— 侧栏水平位置本批次整体外移
+  /// 30.8dp（河豚距窗口边 55.8dp），锁定态若仍留 2 会偏左 30.8dp。
+  /// 河豚无锁定态样本，字形沿用同一套几何（右臂下延接锁身）。
+  Widget _buildLockedOverlay() {
+    return Positioned(
+      left: 32.8,
+      top: 0,
+      bottom: 0,
+      child: Center(
+        child: _sideBtn(
+          glyph: PlayerLockGlyph(locked: true, color: AppTheme.accent),
+          onTap: _toggleLock,
+        ),
+      ),
+    );
+  }
+
+  /// 当前弹出的浮层
+  Widget? _buildPanel() {
+    switch (_panel) {
+      case PlayerPanel.none:
+        return null;
+      case PlayerPanel.rate:
+        return RatePanel(
+          value: _rate,
+          onPick: _applyRate,
+          onClose: _closePanel,
+        );
+      case PlayerPanel.source:
+        return SourcePanel(
+          sources: widget.sources,
+          current: widget.currentSource,
+          // 清晰度入口（`#72` 从底栏撤出后收进本面板顶部）
+          qualityLabel: widget.sources.isEmpty ? null : _qualityText,
+          onQualityTap: () => _openPanel(PlayerPanel.quality),
+          onPick: (s) {
+            _closePanel();
+            widget.onPickSource?.call(s);
+          },
+          onClose: _closePanel,
+        );
+      case PlayerPanel.quality:
+        return QualityPanel(
+          sources: widget.sources,
+          current: widget.currentSource,
+          onPick: (s) {
+            _closePanel();
+            widget.onPickSource?.call(s);
+          },
+          onClose: _closePanel,
+        );
+      case PlayerPanel.buffer:
+        return BufferPanel(
+          value: _bufferSecs,
+          onPick: _applyBuffer,
+          onClose: _closePanel,
+        );
+      case PlayerPanel.skip:
+        return SkipPanel(
+          head: _s.skipHead,
+          tail: _s.skipTail,
+          onChanged: (h, t) => setState(() => _applySkip(h, t)),
+          onClose: () {
+            _persistSkip();
+            setState(_closePanel);
+          },
+        );
+      case PlayerPanel.episodes:
+        return EpisodePanel(
+          groups: widget.episodeGroups,
+          groupIndex: widget.groupIndex,
+          epIndex: widget.epIndex,
+          onGroup: (i) => widget.onPickGroup?.call(i),
+          onPick: (i) {
+            _closePanel();
+            widget.onPickEpisode?.call(i);
+          },
+          onClose: _closePanel,
+        );
+      case PlayerPanel.timer:
+        return SleepTimerPanel(
+          current: _sleepLeft,
+          onPick: _setSleep,
+          onClose: _closePanel,
+        );
+      case PlayerPanel.danmakuSetting:
+        return DanmakuSettingPanel(
+          fontSize: _dmFontSize,
+          area: _dmArea,
+          speed: _dmSpeed,
+          opacity: _dmOpacity,
+          onFontSize: _applyDmFont,
+          onArea: _applyDmArea,
+          onSpeed: _applyDmSpeed,
+          onOpacity: _applyDmOpacity,
+          // 输入框只在「能发 + 弹幕开着」时给，与原来底栏的显示条件一致
+          inputBar: (widget.onSendDanmaku != null && widget.danmakuOn)
+              ? _buildDanmuInput(wide: true)
+              : null,
+          onClose: _closePanel,
+        );
+    }
+  }
+}
+
+/// 弹幕开关：河豚是**自绘的「弹」字方块**（不是 Material 图标）。
+///
+/// 河豚 7.0.0.2 实测（`ROADMAP.md` #52-f）：方框 **53×53px = 19×19dp**（正方形），
+/// 白描边 1.2dp + 圆角 3dp + 白「弹」字，**无底色**；
+/// **关闭态是一条从左上到右下的斜杠**压在方框上（不是我方原来的红点/红底）。
+class _DanmuToggle extends StatelessWidget {
+  const _DanmuToggle({required this.on, required this.onTap});
+
+  final bool on;
+  final VoidCallback? onTap;
+
+  /// 河豚开启态的实测红：`ht_live_fs3.png` 里该控件共 626 个像素落在
+  /// `(255,28,28)`，是画面里唯一的纯红 —— 不是主题色，不是 `Colors.red`。
+  static const Color kOnRed = Color(0xFFFF1C1C);
+
+  @override
+  Widget build(BuildContext context) {
+    // `#72` 第四次标定：河豚**开启态是红色**，我方原来是白色方块 + 斜线
+    // （那是「关闭」语义的形状，正好画反了）。
+    //
+    // 实测（`ht_live_fs3.png`，阈值 r>140 且 g,b<90）：
+    //   整体墨迹 x563~633 × y947~1002 = 71×56px = 25.8×20.4dp
+    //   方块本体 x563~613 × y947~999 = 50×52px = 18.2×18.9dp（圆角 ~3dp）
+    //   右下角圆圈直径 ≈ 33px = 12dp，圆心比方块右下角偏 (+4, -13)px
+    //     ⇒ 圆圈右缘比方块右缘再多 20px=7.3dp，底缘再多 3px=1.1dp
+    //   圆圈是**粗红环 + 环内红对勾**，不是实心圆。
+    // 关闭态河豚真机没拍到（点了就翻开启），沿用我方原有的「白 + 斜线」语义，
+    // 只把底色压到 0.55 alpha 以区分「未开启」。
+    final ink = on ? kOnRed : Colors.white.withValues(alpha: 0.55);
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        child: SizedBox(
+          width: 26,
+          height: 21,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned(
+                left: 0,
+                top: 0,
+                child: CustomPaint(
+                  painter: on ? null : _SlashPainter(ink),
+                  child: Container(
+                    width: 19,
+                    height: 19,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      border: Border.all(color: ink, width: 1.2),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: Text(
+                      '弹',
+                      style: TextStyle(
+                        color: ink,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        height: 1.0,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              // 右下角「已开启」圆圈勾：只在开启态出现（关闭态河豚无此徽标）
+              if (on)
+                Positioned(
+                  right: 0,
+                  bottom: 0,
+                  child: Container(
+                    width: 12,
+                    height: 12,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.55),
+                      shape: BoxShape.circle,
+                      border: Border.all(color: kOnRed, width: 1.6),
+                    ),
+                    child: const Icon(
+                      Icons.check,
+                      size: 8,
+                      color: kOnRed,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 底栏「发个弹幕吧~」半透明胶囊（`#72` 第四次标定加入）。
+///
+/// 河豚沉浸全屏底栏左段第 5 件就是它，之前被三簇互动角标顶掉了位置。
+/// 尺寸全部来自 `ht_live_fs3.png` + `_z_ht_capsule_ruler.png`（5× 带刻度）：
+///   胶囊 855~1095 × 938~998 ⇒ 240×59px = 87×21.5dp，四角全圆（r = h/2）
+///   内文墨迹 898~1077 × 960~989 ⇒ 左内边距 15.6dp，fontSize 12dp
+///   （`#72` 第十二次标定：第十一批 bbox 复测把我方内文从 165px 拉回 180px，
+///   见下方 `fontSize: 12.0` 的逐项推导）
+///   填充是极低透明度白（逐列均值只抬 8~10，反推 alpha ≈ 0.07）——
+///   叠在深色视频上几乎看不出，叠在亮画面上才显形，所以别给 0.16。
+///   纵向 938~998 独立于按钮行（文字组在 1020~1061）—— 偏移在调用处用
+///   `Transform.translate(0, -24.18)` 给，本组件只管盒子本身。
+class _DanmuInputPill extends StatelessWidget {
+  const _DanmuInputPill({this.onTap});
+
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Container(
+        width: 87,
+        height: 21.5,
+        alignment: Alignment.centerLeft,
+        // `#72` 第十二次标定 —— 16 → 15.6dp、右内边距 8 → 0。
+        // 河豚 bbox 实测：胶囊盒 855~1095（240px）、内文墨迹 898~1077（180px）
+        // ⇒ 左内边距 43px = 15.64dp，右内边距 18px = 6.5dp。
+        // 我方改前左内边距 44px，所以墨迹整体右偏 1px；右侧原来留 8dp
+        // （22px）是为了给省略号避让 —— 字号回调后（见下）内文只需 180px，
+        // 可用宽度 87-15.6 = 71.4dp = 196px 足够，把右边距清零顺带
+        // 消掉 6.5dp 的空账。
+        padding: const EdgeInsets.only(left: 15.6),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.07),
+          borderRadius: BorderRadius.circular(11),
+        ),
+        // `#72` 第十次标定 —— 内文被省略号吃了（实测显示「发个弹…」，
+        // 河豚是完整「发个弹幕吧~」）。原因是 `Noto Sans CJK` 的 CJK 字面
+        // advance = 1.0em，fs12dp=33px 时 5 字就占 165px，再加 `~` 超过
+        // 盒内可用 61dp=168px 上限。河豚字面窄一档（实测内文墨迹只 160px）。
+        // 不改盒宽（87dp 是量出来的），改字面：fs 12→11.5（advance 31.6px）
+        // + 字距 -0.5dp，内文落到 ~164px；右边距 10→8 让可用宽度升到 173px。
+        //
+        // `#72` 第十二次标定 —— **回调回 12.0dp、字距归 0**。
+        // 第十批的取舍是「宁可小一档也不要省略号」，但第十一批量到实宽：
+        //   河豚内文墨迹 898~1077 ⇒ **w=180**（h=30）
+        //   我方内文墨迹 905~1069 ⇒ w=165（h=29）
+        // 165/180 = 0.917 ⇒ 11.5 × 180/165 = 12.55dp 才是等比；但字距 -0.5dp
+        // 在 6 个字符上白送了 -3dp ≈ -8px，抵回来正好是 12.0dp：
+        //   实测锚点（fs11.5 / ls-0.5）= 165px，即字面系数 Σ = (165/2.75 + 2.5)/11.5
+        //   ⇒ 目标 180px 需 Σ×fs = 180/2.75 = 65.45dp，fs = 12.0、ls = 0 时
+        //   Σ×(12.0) = 65.3dp = 179.6px ✓
+        // 省略号风险已在上面用「可用 196px > 需要 180px」消掉，`ellipsis`
+        // 只是保险，不会真的触发。
+        child: Text(
+          '发个弹幕吧~',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.72),
+            fontSize: 12.0,
+            letterSpacing: 0,
+            height: 1.0,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 顶栏「电池」字形（`#72` 第四次标定加入，河豚自绘件）。
+///
+/// 尺寸来自 `ht_live_fs3.png` 阈值 150 逐段扫 + `_z_ht_batt.png` 6× 复核：
+///   框 50×34px = 18.2×12.4dp（圆角 2.4dp、描边 2.2px = 0.8dp）
+///   电极 5×16px = 1.8×5.8dp，与框间隔 3px = 1.1dp，垂直居中
+///   框内满格白块：左右各留 2.4/3.6dp，上下各留 2.4dp
+/// 总盒宽 = 18.2 + 1.1 + 1.8 = 21.1dp。
+class _BatteryGlyph extends StatelessWidget {
+  const _BatteryGlyph();
+
+  @override
+  Widget build(BuildContext context) {
+    return const SizedBox(
+      width: 21.1,
+      height: 12.4,
+      child: CustomPaint(painter: _BatteryPainter(Colors.white)),
+    );
+  }
+}
+
+class _BatteryPainter extends CustomPainter {
+  const _BatteryPainter(this.color);
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final stroke = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8;
+    final fill = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+
+    // 电池壳
+    final body = RRect.fromRectAndRadius(
+      const Rect.fromLTWH(0.4, 0.4, 17.8, 11.6),
+      const Radius.circular(2.4),
+    );
+    canvas.drawRRect(body, stroke);
+
+    // 右侧电极（细短竖条，垂直居中）
+    final nub = RRect.fromRectAndRadius(
+      const Rect.fromLTWH(19.2, 3.3, 1.8, 5.8),
+      const Radius.circular(0.6),
+    );
+    canvas.drawRRect(nub, fill);
+
+    // 满格填充块
+    final core = RRect.fromRectAndRadius(
+      const Rect.fromLTWH(2.4, 2.4, 12.0, 7.6),
+      const Radius.circular(1.2),
+    );
+    canvas.drawRRect(core, fill);
+  }
+
+  @override
+  bool shouldRepaint(_BatteryPainter old) => old.color != color;
+}
+
+/// 弹幕关闭态的斜杠（左上 → 右下，压在方框上，略超出四角）
+class _SlashPainter extends CustomPainter {
+  const _SlashPainter(this.color);
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = Paint()
+      ..color = color
+      ..strokeWidth = 1.4
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(Offset(-2, -2), Offset(size.width + 2, size.height + 2), p);
+  }
+
+  @override
+  bool shouldRepaint(_SlashPainter old) => old.color != color;
+}
+
+// ---------------------------------------------------------------------------
+// `#72` 顶栏两颗自绘字形：电视（框内 TV + 独立横杠）/ 画中画（断框 + 箭头 + 小框）
+//
+// 为什么自绘：这两颗河豚用的不是 Material 里的任何一个字形，最接近的
+// `Icons.tv` / `picture_in_picture_alt_outlined` 在框内内容、边框连续性、
+// 箭头有无上都差一截，5× 放大并排一眼能看出来。尺寸全部来自
+// `h10_fullbar.png`（2340×1080，dpr 2.75）的墨迹测量 ÷2.75 换算成 dp。
+// ---------------------------------------------------------------------------
+
+/// 河豚「投屏」图标：圆角框（框内 `TV` 粗体）+ 下方一条独立圆头横杠。
+///
+/// 实测墨迹 63×52px = 23×18.5dp：框 23×14.5、横杠 20×2.4、间隙 1.6，
+/// 线宽 7px = 2.5dp。**横杠比框窄 3dp**，不是等宽的「底座」，这点是它与
+/// `Icons.tv` 的主要形体差别。
+class _TvGlyph extends StatelessWidget {
+  const _TvGlyph({this.size = 25});
+
+  final double size;
+
+  // 控制条是深色渐变衬底，字形恒为白；不做 active 变色（河豚这两颗也不变色）。
+  static const Color color = Colors.white;
+
+  @override
+  Widget build(BuildContext context) {
+    // `#71`：**整件按 `size / 25` 等比缩放**。
+    // 原来内部尺寸全写死（框 23×15.3 / 字 8.5 / 横杠 20×2.2），`size` 只改外框，
+    // 于是传 15.5 反而溢出。河豚小窗里这颗 TV 只有全屏的 0.62 倍
+    // （`ht_ctrl2.png` 墨迹 18×13px vs 全屏 63×52px），所以必须能缩。
+    // `k = 1.0` 时所有数值与 `#72` 第十次标定值逐位相同，全屏零回归。
+    final k = size / 25;
+    return SizedBox(
+      width: size,
+      height: size,
+      // `#72` 第十次标定（TV 件**逐行剖面**对拍，阈值 205，x 窗取整件宽度）：
+      //   河豚（`_c72b_ht_top.png` x1775~1850）行分段 = [(20,61), (68,73)]
+      //        ⇒ 框高 42px=15.3dp / 间隔 6px=2.2dp / 横杠 6px=2.2dp，总高 54px
+      //   我方（`_c80_my_top.png` 同窗）    行分段 = [(23,61), (67,72)]
+      //        ⇒ 框高 39px=14.2dp / 间隔 5px=1.8dp / 横杠 6px，总高 50px
+      // 差的 4px **全在框高**（14.5dp 出 39px，实测比例 0.966），故框高改
+      // 15.3dp、间隔改 2.2dp，总高回到 42+6+6 = 54。加大 4px 后 Column 居中会
+      // 各让 2px，实测顶边会落到 21（河豚 20），再靠底部 0.7dp 内边距把整件
+      // 顶上去 1px —— 底边 73 与河豚对齐。
+      child: Padding(
+        padding: EdgeInsets.only(bottom: 0.7 * k),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 23 * k,
+                height: 15.3 * k,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  border: Border.all(color: color, width: 2.2 * k),
+                  borderRadius: BorderRadius.circular(2.4 * k),
+                ),
+                // `TV` 字高 22px = 8dp；大写字母墨迹 ≈ 0.72em ⇒ fontSize 11，
+                // 但框内只有 15.3-2×2.2 = 10.9dp 净高，取 8.5 让上下各留 1dp。
+                child: Text(
+                  'TV',
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 8.5 * k,
+                    fontWeight: FontWeight.w700,
+                    height: 1.0,
+                    letterSpacing: -0.2 * k,
+                  ),
+                ),
+              ),
+              SizedBox(height: 2.2 * k),
+              Container(
+                width: 20 * k,
+                height: 2.2 * k,
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(1.1 * k),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 河豚顶栏「⋯ 更多」的三点组 —— 全屏与小窗共用一件。
+///
+/// `#72` 全屏标定：点径 4.4dp(12px)、点距 3.45dp(9.5px) ⇒ 整组墨迹 20dp = 55px。
+/// `#71` **第二次**小窗标定：`ht_ctrl2.png` 像素实测三点 x967..1021（整组 55px、
+/// 点径 12px、点距 10px）—— 与全屏**逐位相同**，所以不再需要第二套尺度。
+/// （第一次目视估的 2.4 / 1.9 作废。）
+class _ThreeDots extends StatelessWidget {
+  const _ThreeDots();
+
+  static const double dot = 4.4;
+  static const double gap = 3.45;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (int i = 0; i < 3; i++) ...[
+          if (i > 0) const SizedBox(width: gap),
+          Container(
+            width: dot,
+            height: dot,
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// 河豚「画中画」图标：断开的大框（右上 L + 左下 L）+ 左上 ↘ 箭头 + 右下小空心框。
+///
+/// 实测墨迹 60×51px = 22×18.5dp。大框的四条边**只画两条**：右上角一段弯弧
+/// 接右边、左下角一段弯弧接底边 —— 缺口正好让给箭头（左上）和小框（右下）。
+/// 画完整框再叠小框会在小框内部留一根穿过去的竖线，那是最显眼的破绽。
+class _PipGlyph extends StatelessWidget {
+  const _PipGlyph({this.size = 25});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Center(
+        child: CustomPaint(
+          size: const Size(22, 18.5),
+          painter: const _PipPainter(Colors.white),
+        ),
+      ),
+    );
+  }
+}
+
+class _PipPainter extends CustomPainter {
+  const _PipPainter(this.color);
+
+  final Color color;
+
+  static const double _w = 2.2; // 线宽 6px ≈ 2.2dp
+  static const double _r = 2.4; // 圆角
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final stroke = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = _w
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    final w = size.width, h = size.height;
+    final half = _w / 2;
+
+    // ① 右上 L：顶边从 x=9.5 向右 → 圆角 → 右边向下到 y=8.5
+    final topRight = Path()
+      ..moveTo(9.5, half)
+      ..lineTo(w - _r, half)
+      ..arcToPoint(Offset(w - half, _r),
+          radius: const Radius.circular(_r))
+      ..lineTo(w - half, 8.5);
+    canvas.drawPath(topRight, stroke);
+
+    // ② 左下 L：左边从 y=10.5 向下 → 圆角 → 底边向右到 x=9.5
+    final bottomLeft = Path()
+      ..moveTo(half, 10.5)
+      ..lineTo(half, h - _r)
+      ..arcToPoint(Offset(_r, h - half),
+          radius: const Radius.circular(_r))
+      ..lineTo(9.5, h - half);
+    canvas.drawPath(bottomLeft, stroke);
+
+    // ③ 右下小框：完整空心圆角矩形 10×7.5，紧贴大框右下角内侧
+    final inner = RRect.fromRectAndRadius(
+      Rect.fromLTWH(w - 10.5, h - 7.5, 9.4, 6.4),
+      const Radius.circular(1.2),
+    );
+    canvas.drawRRect(inner, stroke);
+
+    // ④ 左上 ↘ 箭头：杆 (1.5,1.5)→(6.6,6.6)，箭头头用两段短线折出 90° 尖角
+    canvas.drawLine(const Offset(1.5, 1.5), const Offset(6.6, 6.6), stroke);
+    canvas.drawLine(const Offset(6.6, 6.6), const Offset(2.6, 6.6), stroke);
+    canvas.drawLine(const Offset(6.6, 6.6), const Offset(6.6, 2.6), stroke);
+  }
+
+  @override
+  bool shouldRepaint(_PipPainter old) => old.color != color;
+}
+
+/// `#72`：河豚沉浸全屏顶栏**正中偏右**有一颗「当前时间」（`HH:mm` 小字）。
+///
+/// 证据链（不是猜的）：基准图 `shots/h10_fullbar.png` 的顶栏带
+/// x1175~1266 / ink_y 71~101 有一处 `15:20`，而该 PNG 的文件时间正是
+/// `2026-10-29 15:20:30`（`ls --time-style=full-iso`）—— 所以它是**系统当前
+/// 时间**，不是时长、不是弹幕时间戳、也不是定时关闭的剩余时间（定时关闭在
+/// 时钟图标右边以 `label` 形式出现，两者互不影响）。
+///
+/// 位置：墨迹中心 1220.5，屏心 1170 ⇒ 偏右 50px(18dp)，源于河豚顶栏左侧
+/// 留了挖孔位的 inset；垂直方向 ink 中心 86 比返回箭头（76.5）低约 10px，
+/// 所以 `Align` 用了 y=0.30 往下压一点。
+///
+/// 刷新策略：对准**下一个整分**再重建，不做 1s 轮询 —— 控制条整棵子树每秒
+/// 重建一次会白烧帧，而秒级变化在 `HH:mm` 里根本不可见。
+class _TopClock extends StatefulWidget {
+  const _TopClock();
+
+  @override
+  State<_TopClock> createState() => _TopClockState();
+}
+
+class _TopClockState extends State<_TopClock> {
+  Timer? _t;
+  String _s = _TopClockState.fmt();
+
+  static String fmt() {
+    final n = DateTime.now();
+    return '${n.hour.toString().padLeft(2, '0')}:'
+        '${n.minute.toString().padLeft(2, '0')}';
+  }
+
+  void _schedule() {
+    _t?.cancel();
+    final n = DateTime.now();
+    _t = Timer(Duration(seconds: 60 - n.second, milliseconds: -n.millisecond), () {
+      if (!mounted) return;
+      setState(() => _s = _TopClockState.fmt());
+      _schedule();
+    });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _schedule();
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Text(
+        _s,
+        style: const TextStyle(
+          color: Colors.white,
+          // 河豚墨迹 92×29px；13.5dp + letterSpacing 0.4 出 ~97×27px，
+          // 宽度差 5px 来自数字字形本身（Material 默认 Roboto 数字略宽）。
+          fontSize: 13.5,
+          fontWeight: FontWeight.w500,
+          letterSpacing: 0.4,
+          height: 1.0,
+        ),
+      );
+}
+
+/// 「三条圆头杠 + 六边形齿轮」图标（弹幕设置）。
+///
+/// `#72` 第六次标定：整块墨迹 57×44px = 20.7×16.0dp（dpr 2.75）。
+/// 坐标系用 px（0~57 / 0~44），再等比缩放到实际画布，数值与实测一一对应：
+///
+///   杠 A x0~12  y0~9     杠 B x15~46 y0~9     （中间空 3px）
+///   杠 C x0~24  y18~27
+///   杠 D x0~14  y35~44    圆点 E x17~26 y35~44
+///   六边形 x24~57 / y14~44，左右尖角上下平边，中心圆孔 d=8 圆心 (40.5, 29)
+///
+/// 圆头杠 = 圆角半径取 h/2 的圆角矩形（河豚的杠两端是半圆，不是方角）。
+class _DmSettingGlyphPainter extends CustomPainter {
+  const _DmSettingGlyphPainter();
+
+  static const double _pxW = 57;
+  static const double _pxH = 44;
+
+  void _pill(Canvas c, Paint p, double x, double y, double w, double h) {
+    final r = Rect.fromLTWH(x, y, w, h);
+    c.drawRRect(RRect.fromRectAndRadius(r, Radius.circular(h / 2)), p);
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width <= 0 || size.height <= 0) return;
+    final p = Paint()..color = Colors.white..isAntiAlias = true;
+
+    canvas.save();
+    canvas.scale(size.width / _pxW, size.height / _pxH);
+
+    // 三行横杠（每行 9px 高，圆头）
+    _pill(canvas, p, 0, 0, 12, 9); // A
+    _pill(canvas, p, 15, 0, 31, 9); // B
+    _pill(canvas, p, 0, 18, 24, 9); // C
+    _pill(canvas, p, 0, 35, 14, 9); // D
+    _pill(canvas, p, 17, 35, 9, 9); // E
+
+    // 六边形齿轮 + 中心孔（evenOdd 一次填充，省掉 saveLayer）
+    final cx = (24 + 57) / 2; // 40.5
+    final cy = (14 + 44) / 2; // 29
+    final hw = (57 - 24) / 2; // 16.5
+    final hh = (44 - 14) / 2; // 15
+    final qw = hw / 2; // 上下平边的半宽 8.25
+    final hex = Path()
+      ..moveTo(cx - hw, cy)
+      ..lineTo(cx - qw, cy - hh)
+      ..lineTo(cx + qw, cy - hh)
+      ..lineTo(cx + hw, cy)
+      ..lineTo(cx + qw, cy + hh)
+      ..lineTo(cx - qw, cy + hh)
+      ..close();
+    final hole = Path()
+      ..addOval(Rect.fromCircle(center: Offset(cx, cy - 0.5), radius: 4));
+    final glyph = Path.combine(PathOperation.difference, hex, hole);
+    canvas.drawPath(glyph, p);
+
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _DmSettingGlyphPainter oldDelegate) => false;
+}

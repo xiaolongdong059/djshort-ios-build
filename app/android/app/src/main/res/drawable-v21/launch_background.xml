@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 系统启动画面（Flutter 起来之前那 3~4 秒）。
+     放「痞帅兔」的 logo，别再黑着 —— 之前的纯色底用户反馈"打开先黑几秒"。
+     这张图是临时的文字版，真 logo 到了直接覆盖 drawable-*/splash_logo.png。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/splash_bg" />
+    <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/splash_logo" />
+    </item>
+</layer-list>

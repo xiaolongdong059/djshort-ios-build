@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  只授权 cacheDir/apk/ 这一个子目录给 FileProvider。
+  不要写 <cache-path path="." /> —— 那等于把整个缓存目录暴露给任何拿到 URI 的 App。
+  APK 由 AppUpdateService 下载到 getTemporaryDirectory()/apk/ 下。
+-->
+<paths>
+    <cache-path name="apk" path="apk/" />
+</paths>
