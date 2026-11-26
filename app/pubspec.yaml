@@ -1,0 +1,116 @@
+name: heihei
+description: "HeiHei短剧 · 本地目录客户端"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.7
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  http: ^1.2.2
+  crypto: ^3.0.3
+  # AES-128-CBC 纯 Dart 实现：黄果封面是加密的（URL 叫 .jpg，内容是密文），
+  # key/iv 固定，本地解密后才能显示。
+  pointycastle: ^3.9.1
+  flutter_cache_manager: ^3.4.0
+  cached_network_image: ^3.4.1
+  # 播放器：media_kit 封装 libmpv（与河豚同源），HLS/HEVC/奇葩编码都能解
+  media_kit: ^1.2.0
+  media_kit_video: ^1.3.0
+  # 原生库必须按平台分别引入：这两个包各含一个平台的 libmpv，
+  # iOS 构建时 Android 那个会被自动忽略，反之亦然。
+  # （用聚合包 media_kit_libs_video 也行，但它会连带拉 macOS/Windows 的
+  #  几百 MB 依赖，而我们只出 Android + iOS。）
+  media_kit_libs_android_video: ^1.3.7
+  media_kit_libs_ios_video: ^1.1.4
+  # 手势：亮度调节
+  screen_brightness: ^2.1.2
+  # 播放进度本地持久化
+  shared_preferences: ^2.3.3
+  # 崩溃日志落盘目录
+  path_provider: ^2.1.5
+  # 皮肤包（.skin 是不加密 ZIP）解压
+  archive: ^4.5.0
+  share_plus: ^13.3.1
+  flutter_volume_controller: ^2.0.2
+  dlna_dart: ^0.1.1
+  connectivity_plus: 6.1.4
+  font_awesome_flutter: ^11.0.0
+  # QuickJS：把红果取流签名器搬到客户端（去服务端的关键一环）
+  flutter_js: ^0.8.7
+  # HEIC/HEIF 封面解码（MIT）。本机模式不加这个，95.3% 的海报就是白块。
+  # 内部就是 Android BitmapFactory / iOS UIImage，不自己写原生代码。
+  heif_converter: ^1.0.7
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/brand/heihei_logo.png
+    # iOS 7.3.0 截图像素级抠出来的右列图标（bench/icons/ 同源）
+    - assets/icons/
+    # 本机模式（2026-11-25）：全量目录快照，6275 部。首启灌进 CatalogStore，
+    # 之后搜索/列表/详情全部本地生成，不再依赖自有服务器。
+    - assets/catalog.json
+    # 卡片补充字段（简介/热度/点赞/角标/标签/类型），
+    # 由 tools/fetch_catalog_meta.py 从线上列表卡片抓下来。缺了只降级不报错。
+    - assets/catalog_meta.json
+    # 红果 v5 取流签名器（QuickJS 加载：thl-sign.js + 纯 JS crypto 替身）
+    - assets/js/falcon_sign.js
+
+  # 字体：直接取自河豚 APK 的 assets/flutter_assets/assets/fonts/
+  # （HarmonyOS_SansSC_Regular.ttf / _Medium.ttf），保证字形与河豚逐像素一致。
+  # 系统默认（Redmi 上是 MiSans）的「弹」「登」「录」等字笔画、字宽都不同，
+  # 靠 fontSize 硬凑只能对高度，对不了字形骨架。
+  fonts:
+    - family: HarmonyOS
+      fonts:
+        - asset: assets/fonts/HarmonyOS_SansSC_Regular.ttf
+          weight: 400
+        - asset: assets/fonts/HarmonyOS_SansSC_Medium.ttf
+          weight: 500
+    - family: SmileySans
+      fonts:
+        - asset: assets/fonts/SmileySans-Oblique.ttf
+    # 红果 7.4.5.32 的原字体（2026-11-19 从 APK 提取，见 docs/HONGUO-SPEC.md §6）：
+    #   DouYin · Bold   = DouYinFaXianSansBold.ttf   标题 / 按钮 / 集数
+    #   DouYin · Number = DouyinNumberJR-Medium123.ttf 所有数字（2.4KB 等宽数字表）
+    # 两个变体同 family 不同 weight，调用方只写 family: 'DouYin'，
+    # 数字位再显式指定 weight 500（见 core/typo.dart 的 AppType.count/time）。
+    - family: DouYin
+      fonts:
+        - asset: assets/fonts/DouYinFaXianSansBold.ttf
+          weight: 700
+        - asset: assets/fonts/DouyinNumberJR-Medium123.ttf
+          weight: 500
+
+dependency_overrides:
+  # iOS 编译失败的根因（2026-11-02 实测）
+  #
+  # shared_preferences_foundation 2.6.1 的 `messages.g.swift` 用了
+  # Flutter 默认 SWIFT_VERSION=5.0 不支持的语法（Xcode 报
+  # `Unexpected ',' separator`，位置 messages.g.swift:33/357/362），
+  # 导致整个 iOS 构建失败。
+  #
+  # 已排除的方向：不是 media_kit 的问题（它正确回退到了 CocoaPods，
+  # `pod install` 3 秒成功）。换 SWIFT_VERSION 也能解，但那要改 Xcode
+  # 工程文件、影响面更大；锁版本是改动最小的一条。
+  # 等 Flutter 把 iOS 模板的 SWIFT_VERSION 提到 5.9+ 就可以删掉这段。
+  shared_preferences_foundation: 2.5.7
+
+  # jni 1.2.0 已被 pub.dev **撤回（retracted）**，它把 Java 类型描述符
+  # "Landroid/content/Context;" 当成类名去找，运行时炸：
+  #   ClassNotFoundException: Didn't find class "Landroid/content/Context;"
+  #   表现为安卓端**全黑屏**（Flutter 引擎在首帧就抛异常）。
+  #
+  # 来源链：shared_preferences_android 2.5.5 / path_provider_android 2.3.1
+  #        -> jni 1.2.0
+  # 修法：锁到 1.2.1（未撤回，已修该描述符 bug）。
+  jni: 1.2.1

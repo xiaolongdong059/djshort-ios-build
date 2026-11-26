@@ -1,0 +1,238 @@
+// 红果「剧 → 分集 episode_id」解析（本机模式，2026-11-25）。
+//
+// ## 为什么需要它
+//
+// 取流（`HgPlayClient`）只认 **episode_id**（19 位视频 id），而客户端手里只有
+// `hg://<series_id>/<集号>`。服务端过去用 `ohg info <sid>` 查这层映射，本机模式
+// 没有服务端，必须自己拿。
+//
+// ## 用什么拿：官网分集页（免签）
+//
+// 红果短剧官网 `hongguoduanju.com/player/<series_id>` 是**服务端渲染**的，
+// 页面里内嵌 `"vid_list":["7624009906571463705", ...]`，顺序就是集号顺序。
+// 免签名、免登录、普通 GET 即可 —— 不碰 App 侧任何签名接口，也不消耗设备配额。
+//
+// 实测交叉验证（2026-11-25，sid=7624008055360867352）：
+//   官网 vid_list[0] = 7624009906571463705
+//   服务端 `/api/j/detail` 的 episodes[0].epid = 7624009906571463705  ← 完全一致
+//
+// ## 缓存
+//
+// 分集 id 不会变，所以：内存 → 磁盘（`<support>/hg_vids.json`，整表一份）两
+// 级缓存，命中即 0 网络。磁盘上限 4000 部，超了丢最早写入的（简单粗暴够用）。
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+
+import 'trace.dart';
+
+class HgSeriesClient {
+  HgSeriesClient._();
+
+  static const String _origin = 'https://hongguoduanju.com';
+
+  /// 浏览器 UA：官网对空 UA / Dart 默认 UA 会回 403。
+  static const String _ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+  static const Duration _tmo = Duration(seconds: 8);
+
+  /// 磁盘表上限（部）。每部约 71 个 id ≈ 1.4KB，4000 部 ≈ 5.6MB。
+  static const int _maxEntries = 4000;
+
+  static const String _diskName = 'hg_vids.json';
+
+  static final Map<String, List<String>> _mem = <String, List<String>>{};
+  static final Map<String, Future<List<String>?>> _inflight =
+      <String, Future<List<String>?>>{};
+
+  static final Map<String, List<String>> _disk = <String, List<String>>{};
+  static bool _diskReady = false;
+  static bool _dirty = false;
+  static Timer? _saveTimer;
+  static File? _file;
+
+  /// 取某部剧的分集 id 列表（1 基顺序）。失败返回 null（调用方降级，不抛）。
+  static Future<List<String>?> vids(String sid) {
+    if (sid.isEmpty) return Future<List<String>?>.value();
+    final hit = _mem[sid];
+    if (hit != null && hit.isNotEmpty) return Future<List<String>?>.value(hit);
+    final busy = _inflight[sid];
+    if (busy != null) return busy;
+    // 注意：`whenComplete` 的回调**不能写成 `() => _inflight.remove(sid)`**。
+    // 箭头函数的返回值会被当成 `FutureOr<void>` 去 await —— 而 map 里存的
+    // 就是刚建的那个 future 本身，于是它等自己，永久死等（真机实测：日志到
+    // `hgvids.ok` 就断，调用方 `await` 永不返回）。必须用块语句丢弃返回值。
+    final f = _resolve(sid);
+    _inflight[sid] = f;
+    f.whenComplete(() {
+      _inflight.remove(sid);
+    });
+    return f;
+  }
+
+  static Future<List<String>?> _resolve(String sid) async {
+    await _loadDisk();
+    final d = _disk[sid];
+    if (d != null && d.isNotEmpty) {
+      _mem[sid] = d;
+      trace('hgvids.disk', 'sid=$sid n=${d.length}');
+      return d;
+    }
+    final sw = Stopwatch()..start();
+    try {
+      final resp = await http.get(
+        Uri.parse('$_origin/player/$sid'),
+        headers: const {
+          'User-Agent': _ua,
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'zh-CN,zh;q=0.9',
+        },
+      ).timeout(_tmo);
+      if (resp.statusCode != 200) {
+        trace('hgvids.http', 'sid=$sid status=${resp.statusCode}');
+        return null;
+      }
+      final list = _parse(utf8.decode(resp.bodyBytes, allowMalformed: true));
+      if (list == null || list.isEmpty) {
+        trace('hgvids.miss', 'sid=$sid ${resp.bodyBytes.length}B');
+        return null;
+      }
+      _mem[sid] = list;
+      _disk[sid] = list;
+      _dirty = true;
+      _scheduleSave();
+      trace('hgvids.ok', 'sid=$sid n=${list.length} ${sw.elapsedMilliseconds}ms');
+      return list;
+    } catch (e) {
+      trace('hgvids.err', 'sid=$sid $e');
+      return null;
+    }
+  }
+
+  /// 从 SSR HTML 里抠出 `"vid_list":[...]`。
+  ///
+  /// 不做整页 JSON 解析：那是 260KB 的 `_ROUTER_DATA`，结构随版本漂，
+  /// 只盯这一个 key 最稳。括号配对时跳过字符串内容（id 里不含引号，但
+  /// 别的位置可能有转义引号）。
+  static List<String>? _parse(String html) {
+    final at = html.indexOf('"vid_list"');
+    if (at < 0) return null;
+    final open = html.indexOf('[', at);
+    if (open < 0) return null;
+    var depth = 0;
+    var inStr = false;
+    var esc = false;
+    var close = -1;
+    for (var i = open; i < html.length; i++) {
+      final c = html.codeUnitAt(i);
+      if (inStr) {
+        if (esc) {
+          esc = false;
+        } else if (c == 0x5C) {
+          esc = true;
+        } else if (c == 0x22) {
+          inStr = false;
+        }
+        continue;
+      }
+      if (c == 0x22) {
+        inStr = true;
+      } else if (c == 0x5B) {
+        depth++;
+      } else if (c == 0x5D) {
+        depth--;
+        if (depth == 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    if (close < 0) return null;
+    try {
+      final raw = jsonDecode(html.substring(open, close + 1));
+      if (raw is! List) return null;
+      final out = raw
+          .whereType<Object>()
+          .map((e) => e.toString().trim())
+          .where((e) => e.isNotEmpty && RegExp(r'^\d+$').hasMatch(e))
+          .toList();
+      return out.isEmpty ? null : out;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ── 磁盘表 ────────────────────────────────────────────────────────────
+
+  static Future<void> _loadDisk() async {
+    if (_diskReady) return;
+    _diskReady = true;
+    try {
+      final f = await _fileOf();
+      if (f == null || !f.existsSync()) return;
+      final m = jsonDecode(await f.readAsString());
+      if (m is! Map) return;
+      m.forEach((k, v) {
+        if (v is List) {
+          final ids = v.map((e) => e.toString()).where((e) => e.isNotEmpty).toList();
+          if (ids.isNotEmpty) _disk['$k'] = ids;
+        }
+      });
+      trace('hgvids.tbl', 'n=${_disk.length}');
+    } catch (e) {
+      trace('hgvids.tbl.err', '$e');
+    }
+  }
+
+  static Future<File?> _fileOf() async {
+    if (_file != null) return _file;
+    try {
+      final d = await getApplicationSupportDirectory();
+      _file = File('${d.path}/$_diskName');
+      return _file;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 攒 2 秒再写盘：连续预取会连着命中新剧，逐条写会抖动磁盘。
+  static void _scheduleSave() {
+    _saveTimer?.cancel();
+    _saveTimer = Timer(const Duration(seconds: 2), () {
+      unawaited(flush());
+    });
+  }
+
+  /// 落盘（App 退到后台 / 测试收尾时也可显式调）。
+  static Future<void> flush() async {
+    if (!_dirty) return;
+    _dirty = false;
+    try {
+      if (_disk.length > _maxEntries) {
+        final keys = _disk.keys.take(_disk.length - _maxEntries).toList();
+        for (final k in keys) {
+          _disk.remove(k);
+        }
+      }
+      final f = await _fileOf();
+      if (f == null) return;
+      await f.writeAsString(jsonEncode(_disk));
+      trace('hgvids.save', 'n=${_disk.length}');
+    } catch (e) {
+      trace('hgvids.save.err', '$e');
+    }
+  }
+
+  /// 测试/排障用：当前磁盘表条目数。
+  static int get cachedSeries {
+    var n = _mem.length;
+    if (_disk.length > n) n = _disk.length;
+    return n;
+  }
+}
