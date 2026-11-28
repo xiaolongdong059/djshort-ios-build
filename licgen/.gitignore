@@ -1,0 +1,7 @@
+# Flutter 构建产物（49MB，不进仓库）
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.idea/
+*.iml
